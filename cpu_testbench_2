@@ -1,0 +1,1178 @@
+`timescale 1ns / 1ps
+
+// ============================================================================
+//
+// HPU PROJECT
+//
+// PHASE 2 FULL SYSTEM INTEGRATION TESTBENCH
+//
+// Tests:
+//
+//  1. Clock generation
+//  2. Active-low system reset
+//  3. Reset propagation
+//  4. CPU boot from Boot ROM
+//  5. Boot diagnostic program execution
+//  6. GPIO reset
+//  7. GPIO memory-mapped write
+//  8. GPIO switch input read
+//  9. Timer reset
+// 10. Timer counting
+// 11. Timer memory-mapped read
+// 12. System RAM address decode
+// 13. RAM write enable gating
+// 14. RAM full word write/read
+// 15. RAM byte write/read
+// 16. RAM half-word lane write
+// 17. ROM instruction decode
+// 18. RAM instruction decode
+// 19. UART reset state
+// 20. UART TX start
+// 21. UART busy assertion
+// 22. UART status register
+// 23. UART start bit
+// 24. UART return to idle
+// 25. Invalid address response
+// 26. CPU + ROM + RAM + GPIO + TIMER + UART integration
+//
+// ============================================================================
+
+module hpu_phase2_tb;
+
+
+    // ========================================================================
+    // TESTBENCH SIGNALS
+    // ========================================================================
+
+    reg         CLK100MHZ;
+    reg         CPU_RESETN;
+
+    reg [15:0]  SW;
+
+    wire [15:0] LED;
+    wire        UART_TXD;
+
+
+    // ========================================================================
+    // TEST STATISTICS
+    // ========================================================================
+
+    integer total_tests;
+    integer passed_tests;
+    integer failed_tests;
+
+    integer i;
+
+    reg [31:0] timer_before;
+    reg [31:0] timer_after;
+
+    reg [31:0] ram_read_value;
+
+
+    // ========================================================================
+    // DEVICE UNDER TEST
+    // ========================================================================
+
+    hpu_top dut
+    (
+        .CLK100MHZ   (CLK100MHZ),
+        .CPU_RESETN  (CPU_RESETN),
+
+        .SW          (SW),
+
+        .LED         (LED),
+        .UART_TXD    (UART_TXD)
+    );
+
+
+    // ========================================================================
+    // CLOCK
+    //
+    // 100 MHz
+    //
+    // Period = 10 ns
+    // ========================================================================
+
+    initial
+    begin
+
+        CLK100MHZ = 1'b0;
+
+        forever
+        begin
+
+            #5 CLK100MHZ = ~CLK100MHZ;
+
+        end
+
+    end
+
+
+    // ========================================================================
+    // TEST TASKS
+    // ========================================================================
+
+    task check_32;
+
+        input [8*80-1:0] test_name;
+        input [31:0] actual;
+        input [31:0] expected;
+
+        begin
+
+            total_tests = total_tests + 1;
+
+            if (actual === expected)
+            begin
+
+                passed_tests = passed_tests + 1;
+
+                $display(
+                    "[PASS] %-40s : %h",
+                    test_name,
+                    actual
+                );
+
+            end
+
+            else
+            begin
+
+                failed_tests = failed_tests + 1;
+
+                $display(
+                    "[FAIL] %0s",
+                    test_name
+                );
+
+                $display(
+                    "       Expected = %h",
+                    expected
+                );
+
+                $display(
+                    "       Actual   = %h",
+                    actual
+                );
+
+            end
+
+        end
+
+    endtask
+
+
+    task check_16;
+
+        input [8*80-1:0] test_name;
+        input [15:0] actual;
+        input [15:0] expected;
+
+        begin
+
+            total_tests = total_tests + 1;
+
+            if (actual === expected)
+            begin
+
+                passed_tests = passed_tests + 1;
+
+                $display(
+                    "[PASS] %-40s : %h",
+                    test_name,
+                    actual
+                );
+
+            end
+
+            else
+            begin
+
+                failed_tests = failed_tests + 1;
+
+                $display(
+                    "[FAIL] %0s",
+                    test_name
+                );
+
+                $display(
+                    "       Expected = %h",
+                    expected
+                );
+
+                $display(
+                    "       Actual   = %h",
+                    actual
+                );
+
+            end
+
+        end
+
+    endtask
+
+
+    task check_1;
+
+        input [8*80-1:0] test_name;
+        input actual;
+        input expected;
+
+        begin
+
+            total_tests = total_tests + 1;
+
+            if (actual === expected)
+            begin
+
+                passed_tests = passed_tests + 1;
+
+                $display(
+                    "[PASS] %-40s : %b",
+                    test_name,
+                    actual
+                );
+
+            end
+
+            else
+            begin
+
+                failed_tests = failed_tests + 1;
+
+                $display(
+                    "[FAIL] %0s",
+                    test_name
+                );
+
+                $display(
+                    "       Expected = %b",
+                    expected
+                );
+
+                $display(
+                    "       Actual   = %b",
+                    actual
+                );
+
+            end
+
+        end
+
+    endtask
+
+
+    task check_true;
+
+        input [8*80-1:0] test_name;
+        input condition;
+
+        begin
+
+            total_tests = total_tests + 1;
+
+            if (condition)
+            begin
+
+                passed_tests = passed_tests + 1;
+
+                $display(
+                    "[PASS] %0s",
+                    test_name
+                );
+
+            end
+
+            else
+            begin
+
+                failed_tests = failed_tests + 1;
+
+                $display(
+                    "[FAIL] %0s",
+                    test_name
+                );
+
+            end
+
+        end
+
+    endtask
+
+
+    // ========================================================================
+    // MAIN TEST
+    // ========================================================================
+
+    initial
+    begin
+
+
+        // ====================================================================
+        // INITIALIZATION
+        // ====================================================================
+
+        total_tests  = 0;
+        passed_tests = 0;
+        failed_tests = 0;
+
+        CPU_RESETN = 1'b0;
+
+        SW = 16'h0000;
+
+        timer_before = 32'd0;
+        timer_after  = 32'd0;
+
+        ram_read_value = 32'd0;
+
+
+        $display("");
+        $display("============================================================");
+        $display("       HPU PHASE 2 FULL SYSTEM INTEGRATION TEST");
+        $display("============================================================");
+        $display("");
+        $display("Testing:");
+        $display("  CPU");
+        $display("  Boot ROM");
+        $display("  System RAM");
+        $display("  Address Decoder");
+        $display("  GPIO");
+        $display("  Switch Input");
+        $display("  Timer");
+        $display("  UART");
+        $display("  Full System Integration");
+        $display("");
+
+
+        // ====================================================================
+        // APPLY RESET
+        // ====================================================================
+
+        repeat (10)
+            @(posedge CLK100MHZ);
+
+
+        // ====================================================================
+        // RESET TESTS
+        // ====================================================================
+
+        #1;
+
+        check_16(
+            "GPIO LED reset state",
+            LED,
+            16'h0000
+        );
+
+
+        check_1(
+            "UART TX idle during reset",
+            UART_TXD,
+            1'b1
+        );
+
+
+        check_1(
+            "UART busy cleared during reset",
+            dut.UART.busy,
+            1'b0
+        );
+
+
+        check_32(
+            "Timer reset value",
+            dut.timer_value,
+            32'h00000000
+        );
+
+
+        // ====================================================================
+        // RELEASE RESET
+        // ====================================================================
+
+        @(negedge CLK100MHZ);
+
+        CPU_RESETN = 1'b1;
+
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("RUNNING CPU BOOT ROM DIAGNOSTIC");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        // ====================================================================
+        // ALLOW CPU TO EXECUTE ROM PROGRAM
+        //
+        // 300 clock cycles = sufficient for current diagnostic program.
+        // ====================================================================
+
+        repeat (300)
+            @(posedge CLK100MHZ);
+
+
+        #2;
+
+
+        // ====================================================================
+        // CPU / BOOT ROM INTEGRATION RESULT
+        // ====================================================================
+
+        check_16(
+            "CPU Boot ROM diagnostic result",
+            LED,
+            16'hC0DE
+        );
+
+
+        // ====================================================================
+        // TIMER TEST
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING TIMER");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        timer_before = dut.timer_value;
+
+        repeat (20)
+            @(posedge CLK100MHZ);
+
+        timer_after = dut.timer_value;
+
+
+        check_true(
+            "Timer increments after reset",
+            timer_after > timer_before
+        );
+
+
+        // --------------------------------------------------------------------
+        // Force CPU data bus to timer address
+        // --------------------------------------------------------------------
+
+        force dut.data_addr  = 32'h4000_2000;
+        force dut.data_wdata = 32'h0000_0000;
+        force dut.data_we    = 4'b0000;
+        force dut.data_req   = 1'b1;
+
+        #5;
+
+
+        check_true(
+            "Timer address decoder selected",
+            dut.timer_select == 1'b1
+        );
+
+
+        check_32(
+            "Timer memory mapped read",
+            dut.data_rdata,
+            dut.timer_value
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // GPIO OUTPUT TEST
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING GPIO OUTPUT");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        force dut.data_addr  = 32'h4000_1000;
+        force dut.data_wdata = 32'h0000_A55A;
+        force dut.data_we    = 4'b1111;
+        force dut.data_req   = 1'b1;
+
+
+        @(posedge CLK100MHZ);
+
+        #1;
+
+
+        check_true(
+            "GPIO output address decoder selected",
+            dut.gpio_output_select == 1'b1
+        );
+
+
+        check_true(
+            "GPIO write enable asserted",
+            dut.gpio_write_enable == 1'b1
+        );
+
+
+        check_16(
+            "GPIO LED write A55A",
+            LED,
+            16'hA55A
+        );
+
+
+        // Stop write
+
+        force dut.data_we  = 4'b0000;
+        force dut.data_req = 1'b0;
+
+        @(posedge CLK100MHZ);
+
+        #1;
+
+
+        check_16(
+            "GPIO holds previous value",
+            LED,
+            16'hA55A
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // GPIO SWITCH INPUT TEST
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING GPIO SWITCH INPUT");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        SW = 16'h5AA5;
+
+        force dut.data_addr  = 32'h4000_1004;
+        force dut.data_wdata = 32'h0000_0000;
+        force dut.data_we    = 4'b0000;
+        force dut.data_req   = 1'b1;
+
+        #5;
+
+
+        check_true(
+            "GPIO input address decoder selected",
+            dut.gpio_input_select == 1'b1
+        );
+
+
+        check_32(
+            "GPIO switch memory mapped read",
+            dut.data_rdata,
+            32'h0000_5AA5
+        );
+
+
+        SW = 16'h1234;
+
+        #5;
+
+
+        check_32(
+            "GPIO switch input changes dynamically",
+            dut.data_rdata,
+            32'h0000_1234
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // SYSTEM RAM FULL WORD WRITE / READ
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING SYSTEM RAM");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        // RAM base + word 4
+        //
+        // 0x00010010
+
+        force dut.data_addr  = 32'h0001_0010;
+        force dut.data_wdata = 32'h1234_5678;
+        force dut.data_we    = 4'b1111;
+        force dut.data_req   = 1'b1;
+
+
+        #2;
+
+
+        check_true(
+            "RAM data address decoder selected",
+            dut.ram_data_select == 1'b1
+        );
+
+
+        check_32(
+            "RAM write enable full word",
+            {28'd0, dut.ram_we},
+            32'h0000000F
+        );
+
+
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        // Stop write
+
+        force dut.data_we  = 4'b0000;
+        force dut.data_req = 1'b0;
+
+
+        // RAM in the current Phase-2 version uses synchronous read.
+        // Give it two clock cycles.
+
+        @(posedge CLK100MHZ);
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        ram_read_value = dut.data_rdata;
+
+
+        check_32(
+            "RAM full word write/read",
+            ram_read_value,
+            32'h1234_5678
+        );
+
+
+        // ====================================================================
+        // RAM BYTE WRITE TEST
+        //
+        // Expected:
+        //
+        // Original = 12345678
+        //
+        // Write AA to byte lane 0
+        //
+        // Result = 123456AA
+        // ====================================================================
+
+        force dut.data_addr  = 32'h0001_0010;
+        force dut.data_wdata = 32'h000000AA;
+        force dut.data_we    = 4'b0001;
+        force dut.data_req   = 1'b1;
+
+
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        force dut.data_we  = 4'b0000;
+        force dut.data_req = 1'b0;
+
+
+        @(posedge CLK100MHZ);
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        check_32(
+            "RAM byte lane 0 write",
+            dut.data_rdata,
+            32'h1234_56AA
+        );
+
+
+        // ====================================================================
+        // RAM HALF WORD / MULTI BYTE WRITE TEST
+        //
+        // Write BEEF into lanes [15:8] and [23:16]
+        //
+        // Expected:
+        //
+        // 12BE_EFAA
+        //
+        // ====================================================================
+
+        force dut.data_addr  = 32'h0001_0010;
+        force dut.data_wdata = 32'h00BE_EF00;
+        force dut.data_we    = 4'b0110;
+        force dut.data_req   = 1'b1;
+
+
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        force dut.data_we  = 4'b0000;
+        force dut.data_req = 1'b0;
+
+
+        @(posedge CLK100MHZ);
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        check_32(
+            "RAM byte lane combination write",
+            dut.data_rdata,
+            32'h12BE_EFAA
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // RAM WRITE GATING TEST
+        //
+        // CPU request = 0
+        // RAM must NOT receive write enable.
+        // ====================================================================
+
+        force dut.data_addr = 32'h0001_0020;
+        force dut.data_we   = 4'b1111;
+        force dut.data_req  = 1'b0;
+
+        #2;
+
+
+        check_32(
+            "RAM write blocked when data_req = 0",
+            {28'd0, dut.ram_we},
+            32'h00000000
+        );
+
+
+        release dut.data_addr;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // ROM INSTRUCTION ADDRESS DECODE
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING INSTRUCTION MEMORY DECODE");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        force dut.instr_addr = 32'h0000_0000;
+
+        #2;
+
+
+        check_true(
+            "ROM instruction address selected",
+            dut.rom_instr_select == 1'b1
+        );
+
+
+        check_true(
+            "RAM instruction address not selected for ROM",
+            dut.ram_instr_select == 1'b0
+        );
+
+
+        release dut.instr_addr;
+
+
+        // ====================================================================
+        // RAM INSTRUCTION ADDRESS DECODE
+        // ====================================================================
+
+        force dut.instr_addr = 32'h0001_0000;
+
+        #2;
+
+
+        check_true(
+            "RAM instruction address selected",
+            dut.ram_instr_select == 1'b1
+        );
+
+
+        check_true(
+            "ROM instruction address not selected for RAM",
+            dut.rom_instr_select == 1'b0
+        );
+
+
+        release dut.instr_addr;
+
+
+        // ====================================================================
+        // UART RESET / IDLE TEST
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING UART");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        check_1(
+            "UART idle before transmission",
+            dut.UART.busy,
+            1'b0
+        );
+
+
+        check_1(
+            "UART TX line idle high",
+            UART_TXD,
+            1'b1
+        );
+
+
+        // ====================================================================
+        // UART START TEST
+        //
+        // Write ASCII 'A' = 0x41
+        //
+        // Address = 0x40000000
+        // ====================================================================
+
+        force dut.data_addr  = 32'h4000_0000;
+        force dut.data_wdata = 32'h0000_0041;
+        force dut.data_we    = 4'b0001;
+        force dut.data_req   = 1'b1;
+
+
+        #2;
+
+
+        check_true(
+            "UART data address decoder selected",
+            dut.uart_data_select == 1'b1
+        );
+
+
+        check_true(
+            "UART start request asserted",
+            dut.uart_start == 1'b1
+        );
+
+
+        @(posedge CLK100MHZ);
+
+        #2;
+
+
+        check_1(
+            "UART busy asserted",
+            dut.UART.busy,
+            1'b1
+        );
+
+
+        check_1(
+            "UART start bit low",
+            UART_TXD,
+            1'b0
+        );
+
+
+        // Stop request immediately
+
+        force dut.data_we  = 4'b0000;
+        force dut.data_req = 1'b0;
+
+
+        // ====================================================================
+        // UART STATUS REGISTER
+        // ====================================================================
+
+        force dut.data_addr = 32'h4000_0004;
+
+        #2;
+
+
+        check_true(
+            "UART status address decoder selected",
+            dut.uart_status_select == 1'b1
+        );
+
+
+        check_true(
+            "UART status indicates busy",
+            dut.data_rdata[0] == 1'b1
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // WAIT FOR UART TRANSMISSION TO COMPLETE
+        //
+        // UART:
+        //
+        // CLKS_PER_BIT = 868
+        //
+        // Frame:
+        //
+        // Start + 8 data + Stop
+        //
+        // Approximately 8680 clocks.
+        // ====================================================================
+
+        repeat (9000)
+            @(posedge CLK100MHZ);
+
+        #2;
+
+
+        check_1(
+            "UART busy cleared after transmission",
+            dut.UART.busy,
+            1'b0
+        );
+
+
+        check_1(
+            "UART returns to idle high",
+            UART_TXD,
+            1'b1
+        );
+
+
+        // ====================================================================
+        // UART STATUS AFTER TRANSMISSION
+        // ====================================================================
+
+        force dut.data_addr  = 32'h4000_0004;
+        force dut.data_wdata = 32'h0000_0000;
+        force dut.data_we    = 4'b0000;
+        force dut.data_req   = 1'b1;
+
+        #2;
+
+
+        check_true(
+            "UART status indicates idle",
+            dut.data_rdata[0] == 1'b0
+        );
+
+
+        release dut.data_addr;
+        release dut.data_wdata;
+        release dut.data_we;
+        release dut.data_req;
+
+
+        // ====================================================================
+        // INVALID ADDRESS TEST
+        //
+        // An unmapped address must not accidentally select RAM, ROM,
+        // UART, GPIO or TIMER.
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("TESTING INVALID ADDRESS");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        force dut.data_addr = 32'hDEAD_BEEF;
+
+        #2;
+
+
+        check_1(
+            "Invalid address ROM decode inactive",
+            dut.rom_data_select,
+            1'b0
+        );
+
+
+        check_1(
+            "Invalid address RAM decode inactive",
+            dut.ram_data_select,
+            1'b0
+        );
+
+
+        check_1(
+            "Invalid address UART decode inactive",
+            dut.uart_data_select,
+            1'b0
+        );
+
+
+        check_1(
+            "Invalid address GPIO output decode inactive",
+            dut.gpio_output_select,
+            1'b0
+        );
+
+
+        check_1(
+            "Invalid address GPIO input decode inactive",
+            dut.gpio_input_select,
+            1'b0
+        );
+
+
+        check_1(
+            "Invalid address TIMER decode inactive",
+            dut.timer_select,
+            1'b0
+        );
+
+
+        release dut.data_addr;
+
+
+        // ====================================================================
+        // FINAL RESET TEST
+        //
+        // Verify that peripherals correctly return to reset state.
+        // ====================================================================
+
+        $display("");
+        $display("------------------------------------------------------------");
+        $display("FINAL RESET VERIFICATION");
+        $display("------------------------------------------------------------");
+        $display("");
+
+
+        @(negedge CLK100MHZ);
+
+        CPU_RESETN = 1'b0;
+
+
+        repeat (5)
+            @(posedge CLK100MHZ);
+
+        #2;
+
+
+        check_16(
+            "Final reset clears GPIO LEDs",
+            LED,
+            16'h0000
+        );
+
+
+        check_32(
+            "Final reset clears timer",
+            dut.timer_value,
+            32'h00000000
+        );
+
+
+        check_1(
+            "Final reset clears UART busy",
+            dut.UART.busy,
+            1'b0
+        );
+
+
+        check_1(
+            "Final reset UART TX idle high",
+            UART_TXD,
+            1'b1
+        );
+
+
+        // ====================================================================
+        // RESULTS
+        // ====================================================================
+
+        $display("");
+        $display("============================================================");
+        $display("        HPU PHASE 2 SYSTEM REGRESSION RESULTS");
+        $display("============================================================");
+
+        $display(
+            "TOTAL TESTS  : %0d",
+            total_tests
+        );
+
+        $display(
+            "TESTS PASSED : %0d",
+            passed_tests
+        );
+
+        $display(
+            "TESTS FAILED : %0d",
+            failed_tests
+        );
+
+        $display("============================================================");
+        $display("");
+
+
+        if (failed_tests == 0)
+        begin
+
+            $display("****************************************************");
+            $display("*                                                  *");
+            $display("*       HPU PHASE 2 REGRESSION PASSED             *");
+            $display("*                                                  *");
+            $display("*  CPU / ROM / RAM / GPIO / TIMER / UART VERIFIED *");
+            $display("*                                                  *");
+            $display("****************************************************");
+
+        end
+
+        else
+        begin
+
+            $display("****************************************************");
+            $display("*                                                  *");
+            $display("*       HPU PHASE 2 REGRESSION FAILED             *");
+            $display("*                                                  *");
+            $display("*       INVESTIGATE FAILED TESTS ABOVE            *");
+            $display("*                                                  *");
+            $display("****************************************************");
+
+        end
+
+
+        $display("");
+
+        #100;
+
+        $finish;
+
+    end
+
+
+endmodule
