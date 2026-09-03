@@ -1,0 +1,1172 @@
+`timescale 1ns/1ps
+
+module hpu_soc_testbench;
+
+    // ================================================================
+    // CLOCK / RESET / BOARD I/O
+    // ================================================================
+
+    reg        clk;
+    reg        resetn;
+    reg [15:0] sw;
+
+    wire [15:0] led;
+    wire        uart_txd;
+
+    integer failures;
+    integer tests_run;
+
+    reg [31:0] read_data;
+    reg [31:0] status_data;
+    reg [31:0] cycle_data;
+    reg [31:0] elem_data;
+
+    reg [63:0] actual64;
+
+
+    // ================================================================
+    // DUT
+    // ================================================================
+
+    hpu_top DUT (
+        .CLK100MHZ (clk),
+        .CPU_RESETN(resetn),
+        .SW        (sw),
+        .LED       (led),
+        .UART_TXD  (uart_txd)
+    );
+
+
+    // ================================================================
+    // 100 MHz CLOCK
+    // ================================================================
+
+    always #5 clk = ~clk;
+
+
+    // ================================================================
+    // CHECKING TASKS
+    // ================================================================
+
+    task check32;
+        input [31:0] actual;
+        input [31:0] expected;
+        input [8*40-1:0] test_name;
+
+        begin
+            tests_run = tests_run + 1;
+
+            if (actual !== expected) begin
+                failures = failures + 1;
+
+                $display(
+                    "FAIL: %s  actual=%08h expected=%08h",
+                    test_name,
+                    actual,
+                    expected
+                );
+            end
+            else begin
+                $display(
+                    "PASS: %s  value=%08h",
+                    test_name,
+                    actual
+                );
+            end
+        end
+    endtask
+
+
+    task check64;
+        input [63:0] actual;
+        input [63:0] expected;
+        input [8*40-1:0] test_name;
+
+        begin
+            tests_run = tests_run + 1;
+
+            if (actual !== expected) begin
+                failures = failures + 1;
+
+                $display(
+                    "FAIL: %s  actual=%016h expected=%016h",
+                    test_name,
+                    actual,
+                    expected
+                );
+            end
+            else begin
+                $display(
+                    "PASS: %s  value=%016h",
+                    test_name,
+                    actual
+                );
+            end
+        end
+    endtask
+
+
+    // ================================================================
+    // CPU BUS WRITE
+    //
+    // The CPU normally owns these signals.
+    // We temporarily force them for deterministic HPU verification.
+    //
+    // The important point is that the signals are held across an
+    // actual rising clock edge before being released.
+    // ================================================================
+
+    task bus_write;
+        input [31:0] addr;
+        input [31:0] data;
+
+        begin
+            @(negedge clk);
+
+            force DUT.data_addr  = addr;
+            force DUT.data_wdata = data;
+            force DUT.data_we    = 4'b1111;
+            force DUT.data_req   = 1'b1;
+
+            @(posedge clk);
+
+            #1;
+
+            release DUT.data_addr;
+            release DUT.data_wdata;
+            release DUT.data_we;
+            release DUT.data_req;
+
+            @(negedge clk);
+        end
+    endtask
+
+
+    // ================================================================
+    // CPU BUS READ
+    //
+    // Read is sampled while the forced request is active.
+    // ================================================================
+
+    task bus_read;
+        input [31:0] addr;
+        output [31:0] data;
+
+        begin
+            @(negedge clk);
+
+            force DUT.data_addr  = addr;
+            force DUT.data_wdata = 32'd0;
+            force DUT.data_we    = 4'b0000;
+            force DUT.data_req   = 1'b1;
+
+            #1;
+
+            data = DUT.data_rdata;
+
+            @(posedge clk);
+
+            #1;
+
+            release DUT.data_addr;
+            release DUT.data_wdata;
+            release DUT.data_we;
+            release DUT.data_req;
+
+            @(negedge clk);
+        end
+    endtask
+
+
+    // ================================================================
+    // WRITE OPERAND
+    //
+    // 0x5000_1000 + word*4
+    //
+    // A:
+    //   word 0 .. 511
+    //
+    // B:
+    //   word 512 .. 1023
+    // ================================================================
+
+    task write_operand;
+        input integer word_index;
+        input [31:0] value;
+
+        begin
+            bus_write(
+                32'h5000_1000 + (word_index * 4),
+                value
+            );
+        end
+    endtask
+
+
+    // ================================================================
+    // READ OPERAND
+    // ================================================================
+
+    task read_operand;
+        input integer word_index;
+        output [31:0] value;
+
+        begin
+            bus_read(
+                32'h5000_1000 + (word_index * 4),
+                value
+            );
+        end
+    endtask
+
+
+    // ================================================================
+    // READ HPU STATUS
+    //
+    // STATUS:
+    //
+    // bit 0 = BUSY
+    // bit 1 = DONE
+    // bit 2 = ERR
+    // bit 3 = OVF
+    // ================================================================
+
+    task read_status;
+        begin
+            bus_read(
+                32'h5000_0004,
+                status_data
+            );
+        end
+    endtask
+
+
+    // ================================================================
+    // READ RESULT
+    // ================================================================
+
+    task read_result64;
+        reg [31:0] lo;
+        reg [31:0] hi;
+
+        begin
+            bus_read(
+                32'h5000_0018,
+                lo
+            );
+
+            bus_read(
+                32'h5000_001C,
+                hi
+            );
+
+            actual64 = {hi,lo};
+        end
+    endtask
+
+
+    // ================================================================
+    // READ ACCUMULATOR
+    // ================================================================
+
+    task read_acc64;
+        reg [31:0] lo;
+        reg [31:0] hi;
+
+        begin
+            bus_read(
+                32'h5000_0020,
+                lo
+            );
+
+            bus_read(
+                32'h5000_0024,
+                hi
+            );
+
+            actual64 = {hi,lo};
+        end
+    endtask
+
+
+    // ================================================================
+    // WAIT FOR HPU DONE
+    //
+    // We deliberately allow a generous timeout.
+    // ================================================================
+
+    task wait_hpu_done;
+        integer timeout;
+        reg finished;
+
+        begin
+            timeout  = 0;
+            finished = 1'b0;
+
+            while ((timeout < 10000) && !finished) begin
+
+                bus_read(
+                    32'h5000_0004,
+                    status_data
+                );
+
+                if (status_data[2]) begin
+
+                    failures = failures + 1;
+
+                    $display(
+                        "FAIL: HPU ERR asserted STATUS=%08h",
+                        status_data
+                    );
+
+                    finished = 1'b1;
+
+                end
+                else if (status_data[1]) begin
+
+                    finished = 1'b1;
+
+                end
+                else begin
+
+                    timeout = timeout + 1;
+                end
+            end
+
+            if (!finished) begin
+
+                failures = failures + 1;
+
+                $display(
+                    "FAIL: HPU TIMEOUT"
+                );
+
+            end
+        end
+    endtask
+
+
+    // ================================================================
+    // CONFIGURE HPU
+    // ================================================================
+
+    task configure_hpu;
+        input [1:0] precision;
+        input [2:0] opcode;
+        input [31:0] length;
+
+        reg [31:0] config_value;
+
+        begin
+
+            config_value = 32'd0;
+
+            config_value[1:0] = precision;
+            config_value[4:2] = opcode;
+
+            bus_write(
+                32'h5000_0008,
+                config_value
+            );
+
+            bus_write(
+                32'h5000_000C,
+                length
+            );
+
+        end
+    endtask
+
+
+    // ================================================================
+    // START HPU
+    // ================================================================
+
+    task start_hpu;
+
+        begin
+            bus_write(
+                32'h5000_0000,
+                32'h0000_0001
+            );
+        end
+
+    endtask
+
+
+    // ================================================================
+    // RUN COMPLETE HPU OPERATION
+    // ================================================================
+
+    task run_operation;
+        input [1:0] precision;
+        input [2:0] opcode;
+        input [31:0] length;
+        input [63:0] expected;
+        input [8*40-1:0] test_name;
+
+        begin
+
+            configure_hpu(
+                precision,
+                opcode,
+                length
+            );
+
+            start_hpu;
+
+            wait_hpu_done;
+
+            read_result64;
+
+            check64(
+                actual64,
+                expected,
+                test_name
+            );
+
+        end
+    endtask
+
+
+    // ================================================================
+    // INITIAL TEST SEQUENCE
+    // ================================================================
+
+    initial begin
+
+        clk      = 1'b0;
+        resetn   = 1'b0;
+        sw       = 16'h0000;
+
+        failures = 0;
+        tests_run = 0;
+
+        read_data   = 32'd0;
+        status_data = 32'd0;
+        cycle_data  = 32'd0;
+        elem_data   = 32'd0;
+        actual64    = 64'd0;
+
+
+        // ============================================================
+        // RESET
+        // ============================================================
+
+        $display("");
+        $display("====================================================");
+        $display(" HPU SoC PHASE-1 SELF-CHECKING REGRESSION");
+        $display(" Nexys A7-100T / XC7A100T-1CSG324C");
+        $display("====================================================");
+        $display("");
+
+        repeat (5)
+            @(posedge clk);
+
+        resetn = 1'b1;
+
+        // Reset synchronizer + CPU boot.
+        repeat (250)
+            @(posedge clk);
+
+
+        // ============================================================
+        // TEST 1
+        // CPU BOOT
+        // ============================================================
+
+        $display("");
+        $display("TEST 1: CPU BOOT");
+
+        check32(
+            {16'd0,led},
+            32'h0000_C0DE,
+            "CPU boot signature"
+        );
+
+
+        // ============================================================
+        // TEST 2
+        // SWITCH INPUT
+        // ============================================================
+
+        $display("");
+        $display("TEST 2: SWITCH SYNCHRONIZATION");
+
+        sw = 16'hA55A;
+
+        repeat (3)
+            @(posedge clk);
+
+        check32(
+            {16'd0,DUT.sw_sync},
+            32'h0000_A55A,
+            "Switch synchronized"
+        );
+
+
+        // ============================================================
+        // TEST 3
+        // HPU IDLE
+        // ============================================================
+
+        $display("");
+        $display("TEST 3: HPU IDLE STATUS");
+
+        read_status;
+
+        check32(
+            status_data[0],
+            1'b0,
+            "HPU not busy"
+        );
+
+
+        // ============================================================
+        // TEST 4
+        // OPERAND RAM
+        // ============================================================
+
+        $display("");
+        $display("TEST 4: OPERAND RAM");
+
+        write_operand(
+            0,
+            32'h1122_3344
+        );
+
+        write_operand(
+            512,
+            32'hAABB_CCDD
+        );
+
+        read_operand(
+            0,
+            read_data
+        );
+
+        check32(
+            read_data,
+            32'h1122_3344,
+            "Operand A word 0"
+        );
+
+        read_operand(
+            512,
+            read_data
+        );
+
+        check32(
+            read_data,
+            32'hAABB_CCDD,
+            "Operand B word 0"
+        );
+
+
+        // ============================================================
+        // TEST 5
+        // INT8 DOT
+        //
+        // [1,2,3,4] dot [5,6,7,8]
+        // = 70
+        // ============================================================
+
+        $display("");
+        $display("TEST 5: INT8 DOT");
+
+        write_operand(
+            0,
+            32'h0403_0201
+        );
+
+        write_operand(
+            512,
+            32'h0807_0605
+        );
+
+        run_operation(
+            2'd0,
+            3'd1,
+            32'd4,
+            64'd70,
+            "INT8 DOT"
+        );
+
+
+        // ============================================================
+        // TEST 6
+        // SIGNED INT8 DOT
+        //
+        // [-1,2,-3,4] dot [2,3,4,-2]
+        // = -16
+        // ============================================================
+
+        $display("");
+        $display("TEST 6: SIGNED INT8 DOT");
+
+        write_operand(
+            0,
+            32'h04FD_02FF
+        );
+
+        write_operand(
+            512,
+            32'hFE04_0302
+        );
+
+        run_operation(
+            2'd0,
+            3'd1,
+            32'd4,
+            64'hFFFF_FFFF_FFFF_FFF0,
+            "Signed INT8 DOT"
+        );
+
+
+        // ============================================================
+        // TEST 7
+        // INT16 DOT
+        //
+        // [1,2] dot [3,4]
+        // = 11
+        // ============================================================
+
+        $display("");
+        $display("TEST 7: INT16 DOT");
+
+        write_operand(
+            0,
+            32'h0002_0001
+        );
+
+        write_operand(
+            512,
+            32'h0004_0003
+        );
+
+        run_operation(
+            2'd1,
+            3'd1,
+            32'd2,
+            64'd11,
+            "INT16 DOT"
+        );
+
+
+        // ============================================================
+        // TEST 8
+        // SIGNED INT16 DOT
+        //
+        // [-2,3] dot [4,-5]
+        // = -23
+        // ============================================================
+
+        $display("");
+        $display("TEST 8: SIGNED INT16 DOT");
+
+        write_operand(
+            0,
+            32'h0003_FFFE
+        );
+
+        write_operand(
+            512,
+            32'hFFFB_0004
+        );
+
+        run_operation(
+            2'd1,
+            3'd1,
+            32'd2,
+            64'hFFFF_FFFF_FFFF_FFE9,
+            "Signed INT16 DOT"
+        );
+
+
+        // ============================================================
+        // TEST 9
+        // INT32 DOT
+        //
+        // 100000 * 3 = 300000
+        // ============================================================
+
+        $display("");
+        $display("TEST 9: INT32 DOT");
+
+        write_operand(
+            0,
+            32'd100000
+        );
+
+        write_operand(
+            512,
+            32'd3
+        );
+
+        run_operation(
+            2'd2,
+            3'd1,
+            32'd1,
+            64'd300000,
+            "INT32 DOT"
+        );
+
+
+        // ============================================================
+        // TEST 10
+        // SIGNED INT32
+        //
+        // -2 * 3 = -6
+        // ============================================================
+
+        $display("");
+        $display("TEST 10: SIGNED INT32");
+
+        write_operand(
+            0,
+            32'hFFFF_FFFE
+        );
+
+        write_operand(
+            512,
+            32'd3
+        );
+
+        run_operation(
+            2'd2,
+            3'd1,
+            32'd1,
+            64'hFFFF_FFFF_FFFF_FFFA,
+            "Signed INT32"
+        );
+
+
+        // ============================================================
+        // TEST 11
+        // LARGE INT32
+        //
+        // 12345678 * 1234
+        // = 15240740652
+        // ============================================================
+
+        $display("");
+        $display("TEST 11: LARGE INT32");
+
+        write_operand(
+            0,
+            32'd12345678
+        );
+
+        write_operand(
+            512,
+            32'd1234
+        );
+
+        run_operation(
+            2'd2,
+            3'd1,
+            32'd1,
+            64'd15240740652,
+            "Large INT32"
+        );
+
+
+        // ============================================================
+        // TEST 12
+        // SCALAR ADD
+        // ============================================================
+
+        $display("");
+        $display("TEST 12: SCALAR ADD");
+
+        write_operand(
+            0,
+            32'd25
+        );
+
+        write_operand(
+            512,
+            32'd17
+        );
+
+        run_operation(
+            2'd2,
+            3'd2,
+            32'd1,
+            64'd42,
+            "Scalar ADD"
+        );
+
+
+        // ============================================================
+        // TEST 13
+        // SCALAR SUB
+        // ============================================================
+
+        $display("");
+        $display("TEST 13: SCALAR SUB");
+
+        run_operation(
+            2'd2,
+            3'd3,
+            32'd1,
+            64'd8,
+            "Scalar SUB"
+        );
+
+
+        // ============================================================
+        // TEST 14
+        // SCALAR MUL
+        // ============================================================
+
+        $display("");
+        $display("TEST 14: SCALAR MUL");
+
+        run_operation(
+            2'd2,
+            3'd4,
+            32'd1,
+            64'd425,
+            "Scalar MUL"
+        );
+
+
+        // ============================================================
+        // TEST 15
+        // MAC
+        //
+        // First: 7*6 = 42
+        // Second: 3*4 = 12
+        // ACC = 54
+        // ============================================================
+
+        $display("");
+        $display("TEST 15: MAC");
+
+        write_operand(
+            0,
+            32'd7
+        );
+
+        write_operand(
+            512,
+            32'd6
+        );
+
+        run_operation(
+            2'd2,
+            3'd5,
+            32'd1,
+            64'd42,
+            "MAC first"
+        );
+
+        write_operand(
+            0,
+            32'd3
+        );
+
+        write_operand(
+            512,
+            32'd4
+        );
+
+        run_operation(
+            2'd2,
+            3'd5,
+            32'd1,
+            64'd12,
+            "MAC second"
+        );
+
+        read_acc64;
+
+        check64(
+            actual64,
+            64'd54,
+            "MAC accumulator"
+        );
+
+
+        // ============================================================
+        // TEST 16
+        // NOP
+        // ============================================================
+
+        $display("");
+        $display("TEST 16: NOP");
+
+        configure_hpu(
+            2'd0,
+            3'd0,
+            32'd0
+        );
+
+        start_hpu;
+
+        // NOP completes immediately, but give the sequential block
+        // a clock to update DONE.
+        @(posedge clk);
+        #1;
+
+        read_status;
+
+        if ((status_data[1] !== 1'b1) ||
+            (status_data[2] !== 1'b0)) begin
+
+            failures = failures + 1;
+
+            $display(
+                "FAIL: NOP status=%08h",
+                status_data
+            );
+
+        end
+        else begin
+
+            tests_run = tests_run + 1;
+
+            $display(
+                "PASS: NOP completion"
+            );
+
+        end
+
+
+        // ============================================================
+        // TEST 17
+        // INVALID PRECISION
+        // ============================================================
+
+        $display("");
+        $display("TEST 17: INVALID PRECISION");
+
+        configure_hpu(
+            2'd3,
+            3'd1,
+            32'd1
+        );
+
+        start_hpu;
+
+        @(posedge clk);
+        #1;
+
+        read_status;
+
+        if (status_data[2] !== 1'b1) begin
+
+            failures = failures + 1;
+
+            $display(
+                "FAIL: invalid precision did not assert ERR STATUS=%08h",
+                status_data
+            );
+
+        end
+        else begin
+
+            tests_run = tests_run + 1;
+
+            $display(
+                "PASS: invalid precision rejected"
+            );
+
+        end
+
+
+        // ============================================================
+        // TEST 18
+        // INVALID OPCODE
+        // ============================================================
+
+        $display("");
+        $display("TEST 18: INVALID OPCODE");
+
+        configure_hpu(
+            2'd0,
+            3'd6,
+            32'd1
+        );
+
+        start_hpu;
+
+        @(posedge clk);
+        #1;
+
+        read_status;
+
+        if (status_data[2] !== 1'b1) begin
+
+            failures = failures + 1;
+
+            $display(
+                "FAIL: invalid opcode did not assert ERR STATUS=%08h",
+                status_data
+            );
+
+        end
+        else begin
+
+            tests_run = tests_run + 1;
+
+            $display(
+                "PASS: invalid opcode rejected"
+            );
+
+        end
+
+
+        // ============================================================
+        // TEST 19
+        // ZERO-LENGTH DOT
+        // ============================================================
+
+        $display("");
+        $display("TEST 19: ZERO-LENGTH DOT");
+
+        configure_hpu(
+            2'd0,
+            3'd1,
+            32'd0
+        );
+
+        start_hpu;
+
+        @(posedge clk);
+        #1;
+
+        read_status;
+
+        if (status_data[2] !== 1'b1) begin
+
+            failures = failures + 1;
+
+            $display(
+                "FAIL: zero length did not assert ERR STATUS=%08h",
+                status_data
+            );
+
+        end
+        else begin
+
+            tests_run = tests_run + 1;
+
+            $display(
+                "PASS: zero length rejected"
+            );
+
+        end
+
+
+        // ============================================================
+        // TEST 20
+        // ELEMENT COUNT
+        // ============================================================
+
+        $display("");
+        $display("TEST 20: ELEMENT COUNT");
+
+        write_operand(
+            0,
+            32'h0403_0201
+        );
+
+        write_operand(
+            512,
+            32'h0807_0605
+        );
+
+        configure_hpu(
+            2'd0,
+            3'd1,
+            32'd4
+        );
+
+        start_hpu;
+
+        wait_hpu_done;
+
+        bus_read(
+            32'h5000_002C,
+            elem_data
+        );
+
+        check32(
+            elem_data,
+            32'd4,
+            "Element count"
+        );
+
+
+        // ============================================================
+        // TEST 21
+        // CYCLE COUNTER
+        // ============================================================
+
+        $display("");
+        $display("TEST 21: CYCLE COUNTER");
+
+        bus_read(
+            32'h5000_0028,
+            cycle_data
+        );
+
+        tests_run = tests_run + 1;
+
+        if (cycle_data == 32'd0) begin
+
+            failures = failures + 1;
+
+            $display(
+                "FAIL: cycle counter is zero"
+            );
+
+        end
+        else begin
+
+            $display(
+                "PASS: cycle counter=%0d",
+                cycle_data
+            );
+
+        end
+
+
+        // ============================================================
+        // FINAL REPORT
+        // ============================================================
+
+        $display("");
+        $display("====================================================");
+        $display(" PHASE-1 REGRESSION COMPLETE");
+        $display(" TESTS    = %0d", tests_run);
+        $display(" FAILURES = %0d", failures);
+        $display("====================================================");
+
+        if (failures == 0) begin
+
+            $display("");
+            $display("****************************************");
+            $display("*      ALL CHECKS PASSED               *");
+            $display("****************************************");
+            $display("");
+
+        end
+        else begin
+
+            $display("");
+            $display("****************************************");
+            $display("*      REGRESSION FAILED               *");
+            $display("*      FAILURES = %0d                  *", failures);
+            $display("****************************************");
+            $display("");
+
+        end
+
+        $finish;
+
+    end
+
+endmodule
