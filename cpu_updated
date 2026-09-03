@@ -1,45 +1,184 @@
+// ============================================================================
+// HPU PROJECT - PHASE 1
+// CONSOLIDATED SoC SOURCE
+//
+// File            : hpu_soc.v
+// Target board    : Digilent Nexys A7-100T
+// FPGA            : Xilinx Artix-7 XC7A100T-1CSG324C
+// Language        : Verilog-2001
+//
+// ----------------------------------------------------------------------------
+// PURPOSE
+// ----------------------------------------------------------------------------
+// This file is a VERBATIM CONSOLIDATION of the nine individually verified
+// Phase-1 RTL source files.  It exists only to make the design easier to
+// import into Vivado as a single translation unit.  Nothing has been
+// redesigned, refactored, optimised, renamed or re-timed.
+//
+// Every module body below is byte-for-byte identical to its original file.
+// The only text added by the merge is this header and the nine separator
+// banners.  Each source file's own `timescale directive is preserved.
+//
+// ----------------------------------------------------------------------------
+// CONTENTS (in order)
+// ----------------------------------------------------------------------------
+//   1. hpu_top               top level, Vivado top module
+//   2. hpu_cpu               RISC-V RV32I control processor
+//   3. hpu_compute_engine    INT8 / INT16 / INT32 accelerator
+//   4. operand_ram           1024 x 32 local operand memory
+//   5. boot_rom              boot / program memory
+//   6. system_ram            data + executable memory
+//   7. gpio_unit             LEDs + switch input
+//   8. timer_unit            free-running counter
+//   9. uart_tx               UART transmitter
+//
+// Architecture: one shared compute datapath, four shared DSP-capable
+// multiplier lanes, 64-bit signed accumulator, optional saturation, sticky
+// overflow, CPU-polled MMIO.  No AXI, no DMA, no interrupts, no scheduler.
+//
+// See docs/04_phase1_implementation_contract.md.
+// ============================================================================
+
 `timescale 1ns / 1ps
-
 // ============================================================================
-// HPU PHASE 3A
-// BRAM-OPTIMIZED UNIFIED MEMORY FOUNDATION
+// HPU PROJECT - PHASE 1
+// CPU / MEMORY / PERIPHERAL FOUNDATION
 //
-// Target:
-//   Digilent Nexys A7-100T
-//   XC7A100T-1CSG324C
+// Target Board:
+// Digilent Nexys A7-100T
+// FPGA:
+// Xilinx Artix-7 XC7A100T-1CSG324C
 //
-// Resource strategy:
+// Language:
+// Verilog-2001
 //
-//   CPU register file  -> FFs
-//   Unified memory     -> BRAM
-//   Future compute     -> LUT + DSP
-//   Boot ROM           -> small combinational ROM
+// Architecture:
 //
-// IMPORTANT:
-//   This version preserves the verified CPU behavior.
-//   The main changes are implementation/resource cleanups.
+//   CPU              : Control processor
+//   Boot ROM         : Boot/program memory
+//   System RAM       : Data + executable memory
+//   GPIO             : LEDs + Switch input
+//   Timer            : Free-running counter
+//   UART             : Transmitter + busy status
+//
+//   PHASE 1:
+//   Compute Engine   : Adaptive-precision accelerator (INT8 / INT16 / INT32)
+//   Operand RAM      : 1024 x 32 local operand memory for the engine
+//
+// Memory Map:
+//
+//   0x0000_0000 - 0x0000_FFFF : Boot ROM
+//   0x0001_0000 - 0x0001_FFFF : System RAM
+//
+//   0x4000_0000              : UART TX DATA
+//   0x4000_0004              : UART STATUS
+//
+//   0x4000_1000              : GPIO OUTPUT
+//   0x4000_1004              : GPIO INPUT
+//
+//   0x4000_2000              : TIMER COUNT
+//
+//   0x5000_0000 - 0x5000_0FFF : COMPUTE ENGINE REGISTERS
+//   0x5000_1000 - 0x5000_1FFF : COMPUTE ENGINE OPERAND WINDOW
+//
+// Reserved:
+//
+//   0x5000_2000              : Intelligent Scheduler (future)
+//   0x6000_0000              : GPU
+//   0x7000_0000              : NPU
+//   0x8000_0000              : ISP
+//   0x9000_0000              : SD / DMA
+//
+// ----------------------------------------------------------------------------
+// PHASE 1 COMPUTE ENGINE NOTES
+// ----------------------------------------------------------------------------
+// The engine is memory-mapped on the CPU data bus and uses exactly the same
+// decode-and-select pattern as the timer and GPIO.  No ready/valid handshake
+// and no wait states are added: every register captures in one clock and the
+// CPU polls STATUS.BUSY / STATUS.DONE.
+//
+// The engine's operand feed is physically separate from the CPU register and
+// control path.  Operands live in their own local memory, reached through the
+// engine's own addr / rdata / valid ports.  In Phase 3 those ports are
+// re-pointed at shared_memory without changing the compute core.
+//
+// See docs/04_phase1_implementation_contract.md.
+// ----------------------------------------------------------------------------
+//
 // ============================================================================
 
-
-// ============================================================================
-// TOP LEVEL
-// ============================================================================
-
-(* keep_hierarchy = "yes" *)
-module hpu_top(
+module hpu_top
+(
     input  wire        CLK100MHZ,
     input  wire        CPU_RESETN,
+
     input  wire [15:0] SW,
+
     output wire [15:0] LED,
     output wire        UART_TXD
 );
 
+
+    // ------------------------------------------------------------------------
+    // RESET SYNCHRONIZATION  (F-03)
+    //
+    // CPU_RESETN comes from an off-chip push button with no timing
+    // relationship to CLK100MHZ.  The internal reset architecture stays fully
+    // synchronous - only the pad is conditioned here.
+    //
+    //   * two synchroniser stages remove metastability on de-assertion
+    //   * the flip-flops power up cleared through their INIT value, so reset
+    //     is held asserted from configuration until the button is released
+    //   * ASYNC_REG keeps the two stages physically adjacent and stops
+    //     Vivado from optimising the chain away
+    //
+    // Behaviour as seen by the rest of the design is unchanged: reset is
+    // asserted while the button is held, and released two clocks later.
+    // ------------------------------------------------------------------------
+
+    (* ASYNC_REG = "TRUE" *)
+    reg [1:0] resetn_sync;
+
+    initial
+    begin
+        resetn_sync = 2'b00;
+    end
+
+    always @(posedge CLK100MHZ)
+    begin
+        resetn_sync <= { resetn_sync[0], CPU_RESETN };
+    end
+
     wire reset;
-    assign reset = ~CPU_RESETN;
+
+    assign reset = ~resetn_sync[1];
 
 
     // ------------------------------------------------------------------------
-    // CPU instruction interface
+    // SWITCH INPUT SYNCHRONIZATION  (F-03)
+    //
+    // SW[15:0] is sampled by the CPU data-read multiplexer.  The pads are
+    // asynchronous to CLK100MHZ, so they are synchronised into the clock
+    // domain before the CPU can observe them.  The CPU's load path already
+    // tolerates the two extra cycles of latency (it samples data_rdata two
+    // clocks after issuing the address), so no protocol change is needed.
+    // ------------------------------------------------------------------------
+
+    (* ASYNC_REG = "TRUE" *)
+    reg [15:0] sw_meta;
+
+    (* ASYNC_REG = "TRUE" *)
+    reg [15:0] sw_sync;
+
+    always @(posedge CLK100MHZ)
+    begin
+        sw_meta <= SW;
+        sw_sync <= sw_meta;
+    end
+
+
+    // ------------------------------------------------------------------------
+    // CPU INSTRUCTION BUS
     // ------------------------------------------------------------------------
 
     wire [31:0] instr_addr;
@@ -47,27 +186,18 @@ module hpu_top(
 
 
     // ------------------------------------------------------------------------
-    // CPU data interface
+    // CPU DATA BUS
     // ------------------------------------------------------------------------
 
     wire [31:0] data_addr;
     wire [31:0] data_wdata;
-    wire [31:0] data_rdata;
     wire [3:0]  data_we;
     wire        data_req;
+    wire [31:0] data_rdata;
 
 
     // ------------------------------------------------------------------------
-    // ADDRESS MAP
-    //
-    // 0x0000_0000 - 0x0000_FFFF : Boot ROM
-    // 0x0001_0000 - 0x0001_FFFF : Unified BRAM
-    //
-    // 0x4000_0000                 UART TX
-    // 0x4000_0004                 UART status
-    // 0x4000_1000                 GPIO output
-    // 0x4000_1004                 GPIO input
-    // 0x4000_2000                 Timer
+    // ADDRESS SELECT SIGNALS
     // ------------------------------------------------------------------------
 
     wire rom_instr_select;
@@ -78,36 +208,108 @@ module hpu_top(
 
     wire uart_data_select;
     wire uart_status_select;
+
     wire gpio_output_select;
     wire gpio_input_select;
+
     wire timer_select;
 
-    assign rom_instr_select = (instr_addr[31:16] == 16'h0000);
-    assign ram_instr_select = (instr_addr[31:16] == 16'h0001);
-
-    assign rom_data_select  = (data_addr[31:16] == 16'h0000);
-    assign ram_data_select  = (data_addr[31:16] == 16'h0001);
-
-    assign uart_data_select   = (data_addr == 32'h4000_0000);
-    assign uart_status_select = (data_addr == 32'h4000_0004);
-
-    assign gpio_output_select = (data_addr == 32'h4000_1000);
-    assign gpio_input_select  = (data_addr == 32'h4000_1004);
-
-    assign timer_select       = (data_addr == 32'h4000_2000);
+    wire ce_reg_select;
+    wire ce_mem_select;
 
 
     // ------------------------------------------------------------------------
-    // ROM / RAM buses
+    // INSTRUCTION ADDRESS DECODE
+    // ------------------------------------------------------------------------
+
+    // Boot ROM : 0x0000_0000 - 0x0000_FFFF
+    //
+    // The lower-bound test (instr_addr >= 32'h0000_0000) was removed: for an
+    // unsigned 32-bit value it is always true, and it made the tools emit a
+    // "comparison is constant" warning.  Behaviour is identical.
+
+    assign rom_instr_select =
+        (instr_addr <  32'h0001_0000);
+
+    assign ram_instr_select =
+        (instr_addr >= 32'h0001_0000) &&
+        (instr_addr <  32'h0002_0000);
+
+
+    // ------------------------------------------------------------------------
+    // DATA ADDRESS DECODE
+    // ------------------------------------------------------------------------
+
+    assign rom_data_select =
+        (data_addr <  32'h0001_0000);
+
+    assign ram_data_select =
+        (data_addr >= 32'h0001_0000) &&
+        (data_addr <  32'h0002_0000);
+
+
+    assign uart_data_select =
+        (data_addr == 32'h4000_0000);
+
+    assign uart_status_select =
+        (data_addr == 32'h4000_0004);
+
+
+    assign gpio_output_select =
+        (data_addr == 32'h4000_1000);
+
+    assign gpio_input_select =
+        (data_addr == 32'h4000_1004);
+
+
+    assign timer_select =
+        (data_addr == 32'h4000_2000);
+
+
+    // --------------------------------------------------------------------
+    // PHASE 1 COMPUTE ENGINE DECODE
+    //
+    // Both comparisons are genuine range tests, so neither is a tautology
+    // and no "comparison is constant" warning is introduced (F-06 class).
+    // --------------------------------------------------------------------
+
+    assign ce_reg_select =
+        (data_addr >= 32'h5000_0000) &&
+        (data_addr <  32'h5000_1000);
+
+    assign ce_mem_select =
+        (data_addr >= 32'h5000_1000) &&
+        (data_addr <  32'h5000_2000);
+
+
+    // ------------------------------------------------------------------------
+    // ROM SIGNALS
     // ------------------------------------------------------------------------
 
     wire [31:0] rom_instr_data;
     wire [31:0] rom_data_rdata;
 
+
+    // ------------------------------------------------------------------------
+    // RAM SIGNALS
+    // ------------------------------------------------------------------------
+
     wire [31:0] ram_instr_data;
     wire [31:0] ram_data_rdata;
 
     wire [3:0] ram_we;
+
+
+    // ------------------------------------------------------------------------
+    // CRITICAL RAM WRITE GATING
+    //
+    // RAM receives write enables ONLY when:
+    //
+    // 1. CPU has an active request
+    // 2. Address belongs to RAM
+    // 3. CPU requested a write
+    //
+    // ------------------------------------------------------------------------
 
     assign ram_we =
         (data_req && ram_data_select) ?
@@ -116,24 +318,26 @@ module hpu_top(
 
 
     // ------------------------------------------------------------------------
-    // UART
+    // UART SIGNALS
     // ------------------------------------------------------------------------
 
     wire uart_start;
     wire uart_busy;
 
+
     assign uart_start =
         data_req &&
         uart_data_select &&
         (data_we != 4'b0000) &&
-        !uart_busy;
+        (~uart_busy);
 
 
     // ------------------------------------------------------------------------
-    // GPIO
+    // GPIO WRITE SIGNAL
     // ------------------------------------------------------------------------
 
     wire gpio_write_enable;
+
 
     assign gpio_write_enable =
         data_req &&
@@ -142,96 +346,177 @@ module hpu_top(
 
 
     // ------------------------------------------------------------------------
-    // FUTURE HPU SHARED MEMORY MASTER
-    //
-    // Phase 3A:
-    //   HPU master is idle.
-    //
-    // Phase 3B:
-    //   Computational fabric will drive these signals.
+    // PHASE 1 COMPUTE ENGINE SIGNALS
     // ------------------------------------------------------------------------
 
-    wire        hpu_mem_req;
-    wire [13:0] hpu_mem_word_addr;
-    wire [31:0] hpu_mem_wdata;
-    wire [3:0]  hpu_mem_we;
+    wire [3:0]  ce_reg_we;
+    wire [3:0]  ce_mem_we;
 
-    wire [31:0] hpu_mem_rdata;
-    wire        hpu_mem_grant;
+    wire [31:0] ce_reg_rdata;
+    wire [31:0] ce_mem_rdata;
 
-    assign hpu_mem_req       = 1'b0;
-    assign hpu_mem_word_addr = 14'd0;
-    assign hpu_mem_wdata     = 32'd0;
-    assign hpu_mem_we        = 4'b0000;
+    wire [9:0]  ce_opa_addr;
+    wire [31:0] ce_opa_wdata;
+    wire [3:0]  ce_opa_we;
+    wire [31:0] ce_opa_rdata;
+    wire        ce_opa_valid;
+
+    wire [9:0]  ce_opb_addr;
+    wire [31:0] ce_opb_rdata;
+    wire        ce_opb_valid;
+
+    // Byte enables are gated by data_req and the region select, exactly as
+    // the RAM write enable is gated above.  The engine additionally ignores
+    // operand-window accesses while it is running.
+
+    assign ce_reg_we =
+        (data_req && ce_reg_select) ?
+        data_we :
+        4'b0000;
+
+    assign ce_mem_we =
+        (data_req && ce_mem_select) ?
+        data_we :
+        4'b0000;
 
 
     // ------------------------------------------------------------------------
     // CPU
     // ------------------------------------------------------------------------
 
-    hpu_cpu CPU (
+    hpu_cpu CPU
+    (
+        .clk         (CLK100MHZ),
+        .reset       (reset),
+
+        .instr_addr  (instr_addr),
+        .instr_data  (instr_data),
+
+        .data_addr   (data_addr),
+        .data_wdata  (data_wdata),
+        .data_we     (data_we),
+        .data_req    (data_req),
+
+        .data_rdata  (data_rdata)
+    );
+
+
+    // ------------------------------------------------------------------------
+    // PHASE 1 COMPUTE ENGINE
+    //
+    // Register block  : 0x5000_0000 - 0x5000_0FFF
+    // Operand window  : 0x5000_1000 - 0x5000_1FFF
+    // ------------------------------------------------------------------------
+
+    hpu_compute_engine COMPUTE_ENGINE
+    (
         .clk        (CLK100MHZ),
         .reset      (reset),
 
-        .instr_addr (instr_addr),
-        .instr_data (instr_data),
+        .reg_select (data_req && ce_reg_select),
+        .reg_addr   (data_addr[7:2]),
+        .reg_wdata  (data_wdata),
+        .reg_we     (ce_reg_we),
+        .reg_rdata  (ce_reg_rdata),
 
-        .data_addr  (data_addr),
-        .data_wdata (data_wdata),
-        .data_we    (data_we),
-        .data_req   (data_req),
-        .data_rdata (data_rdata)
+        .mem_select (data_req && ce_mem_select),
+        .mem_addr   (data_addr[11:2]),
+        .mem_wdata  (data_wdata),
+        .mem_we     (ce_mem_we),
+        .mem_rdata  (ce_mem_rdata),
+
+        .opa_addr   (ce_opa_addr),
+        .opa_wdata  (ce_opa_wdata),
+        .opa_we     (ce_opa_we),
+        .opa_rdata  (ce_opa_rdata),
+        .opa_valid  (ce_opa_valid),
+
+        .opb_addr   (ce_opb_addr),
+        .opb_rdata  (ce_opb_rdata),
+        .opb_valid  (ce_opb_valid)
+    );
+
+
+    // ------------------------------------------------------------------------
+    // PHASE 1 OPERAND MEMORY
+    //
+    // Port 0 is time-shared: the CPU owns it while the engine is idle, the
+    // engine owns it while the engine is running.  Port 1 is always the
+    // engine's B-vector fetch.
+    // ------------------------------------------------------------------------
+
+    operand_ram OPERAND_RAM
+    (
+        .clk         (CLK100MHZ),
+        .reset       (reset),
+
+        .port0_addr  (ce_opa_addr),
+        .port0_wdata (ce_opa_wdata),
+        .port0_we    (ce_opa_we),
+        .port0_rdata (ce_opa_rdata),
+        .port0_valid (ce_opa_valid),
+
+        .port1_addr  (ce_opb_addr),
+        .port1_rdata (ce_opb_rdata),
+        .port1_valid (ce_opb_valid)
     );
 
 
     // ------------------------------------------------------------------------
     // BOOT ROM
+    //
+    // Only word addresses [15:2] are passed.
+    //
+    // This removes unused address-bit warnings.
     // ------------------------------------------------------------------------
 
-    boot_rom BOOT_ROM (
-        .instr_word_addr(instr_addr[7:2]),
-        .instr_rdata    (rom_instr_data),
+    boot_rom BOOT_ROM
+    (
+        .clk             (CLK100MHZ),
 
-        .data_word_addr (data_addr[7:2]),
-        .data_rdata     (rom_data_rdata)
+        .instr_word_addr (instr_addr[15:2]),
+        .instr_rdata     (rom_instr_data),
+
+        .data_word_addr  (data_addr[15:2]),
+        .data_rdata      (rom_data_rdata)
     );
 
 
     // ------------------------------------------------------------------------
-    // UNIFIED SYSTEM MEMORY
+    // SYSTEM RAM
     // ------------------------------------------------------------------------
 
-    system_ram SYSTEM_RAM (
-        .clk(CLK100MHZ),
-        .reset(reset),
+    system_ram SYSTEM_RAM
+    (
+        .clk             (CLK100MHZ),
 
-        .instr_word_addr(instr_addr[15:2]),
-        .instr_rdata    (ram_instr_data),
+        .instr_word_addr (instr_addr[15:2]),
+        .instr_rdata     (ram_instr_data),
 
-        .cpu_data_req       (data_req && ram_data_select),
-        .cpu_data_word_addr (data_addr[15:2]),
-        .cpu_data_wdata     (data_wdata),
-        .cpu_we             (ram_we),
-        .cpu_data_rdata     (ram_data_rdata),
+        .data_word_addr  (data_addr[15:2]),
+        .data_wdata      (data_wdata),
+        .we              (ram_we),
 
-        .hpu_mem_req        (hpu_mem_req),
-        .hpu_mem_word_addr  (hpu_mem_word_addr),
-        .hpu_mem_wdata      (hpu_mem_wdata),
-        .hpu_mem_we         (hpu_mem_we),
-        .hpu_mem_rdata      (hpu_mem_rdata),
-        .hpu_mem_grant      (hpu_mem_grant)
+        .data_rdata      (ram_data_rdata)
     );
 
 
     // ------------------------------------------------------------------------
     // GPIO
+    //
+    // Only lower 16 bits are physically connected to LEDs.
+    //
+    // Passing only 16 bits removes the unused upper-bit warning.
     // ------------------------------------------------------------------------
 
-    gpio_unit GPIO (
+    gpio_unit GPIO
+    (
         .clk          (CLK100MHZ),
         .reset        (reset),
+
         .write_enable (gpio_write_enable),
         .wdata        (data_wdata[15:0]),
+
         .leds         (LED)
     );
 
@@ -242,10 +527,13 @@ module hpu_top(
 
     wire [31:0] timer_value;
 
-    timer_unit TIMER (
-        .clk        (CLK100MHZ),
-        .reset      (reset),
-        .timer_value(timer_value)
+
+    timer_unit TIMER
+    (
+        .clk         (CLK100MHZ),
+        .reset       (reset),
+
+        .timer_value (timer_value)
     );
 
 
@@ -253,303 +541,424 @@ module hpu_top(
     // UART
     // ------------------------------------------------------------------------
 
-    uart_tx UART (
+    uart_tx UART
+    (
         .clk   (CLK100MHZ),
         .reset (reset),
+
         .start (uart_start),
         .data  (data_wdata[7:0]),
+
         .tx    (UART_TXD),
         .busy  (uart_busy)
     );
 
 
     // ------------------------------------------------------------------------
-    // INSTRUCTION MUX
+    // INSTRUCTION READ MUX
+    //
+    // CPU can execute instructions from:
+    //
+    // Boot ROM
+    // System RAM
+    //
     // ------------------------------------------------------------------------
 
     assign instr_data =
-        rom_instr_select ? rom_instr_data :
-        ram_instr_select ? ram_instr_data :
-                           32'h0000_0013;
+
+        rom_instr_select ?
+
+            rom_instr_data :
+
+        ram_instr_select ?
+
+            ram_instr_data :
+
+            32'h0000_0013;
 
 
     // ------------------------------------------------------------------------
-    // DATA MUX
+    // DATA READ MUX
     // ------------------------------------------------------------------------
 
     assign data_rdata =
+
         rom_data_select ?
+
             rom_data_rdata :
 
         ram_data_select ?
+
             ram_data_rdata :
 
         uart_status_select ?
+
             {31'd0, uart_busy} :
 
         gpio_input_select ?
-            {16'd0, SW} :
+
+            {16'd0, sw_sync} :
 
         timer_select ?
+
             timer_value :
 
-        hpu_mem_req ?
-            hpu_mem_rdata :
+        ce_reg_select ?
+
+            ce_reg_rdata :
+
+        ce_mem_select ?
+
+            ce_mem_rdata :
 
             32'd0;
+
 
 endmodule
 
 
-
 // ============================================================================
-// VERIFIED RV32I CPU
+// END OF MODULE: hpu_top
+// ============================================================================
+
+`timescale 1ns / 1ps
+// ============================================================================
+// HPU CPU
 //
-// x0 is implemented as a constant zero; x1..x31 are physical FF registers.
-// Hierarchy is preserved so Vivado can retain the CPU as a clean cellview.
-// This removes the floorplanning methodology warning without changing logic.
+// Small multi-cycle RV32I-style processor.  This is the CONTROL plane of the
+// HPU: it fetches and executes the control program and reaches every
+// peripheral and accelerator through ordinary memory-mapped loads and stores.
+//
+// This module contains NO compute-engine, GPU, NPU, ISP or scheduler logic.
+// The Phase-1 compute engine is a separate memory-mapped module OUTSIDE the
+// CPU (rtl/hpu_compute_engine.v), reached through exactly the same data bus
+// as the timer and the GPIO.
+//
+// ----------------------------------------------------------------------------
+// INSTRUCTION INTERFACE - F-01 Option B (approved synchronous-memory baseline)
+// ----------------------------------------------------------------------------
+// The instruction address is the PC directly:
+//
+//     assign instr_addr = pc;
+//
+// This is what makes the CPU work with a SYNCHRONOUS (Block RAM) instruction
+// memory.  boot_rom and system_ram both register their read output, so the
+// addressed word appears one clock after the address is presented:
+//
+//     cycle N    : pc = P, instr_addr = P      (address presented)
+//     cycle N+1  : instr_data = mem[P]         (DECODE samples it)
+//
+// DECODE captures instr_data and only then advances the PC, so the executed
+// instruction always belongs to the PC that was presented - never to PC-4.
+// The previous design registered instr_addr, which delayed the address by one
+// clock and made the CPU execute the wrong instruction with synchronous
+// memory.  No extra execution cycle is used to compensate for the memory
+// latency: the fix is the direct PC-to-address interface above.
+//
+// ----------------------------------------------------------------------------
+// DATA INTERFACE
+// ----------------------------------------------------------------------------
+// Single-cycle, no handshake:
+//
+//     data_addr / data_wdata / data_we[3:0] / data_req    outputs
+//     data_rdata                                          input
+//
+// There is no ready, no valid and no wait state, and the CPU never stalls on
+// a peripheral.  A store presents address, data and byte enables for exactly
+// one clock.  A load holds the address for two clocks (MEM_READ then
+// MEM_CAPTURE) so a synchronous memory can answer inside the same window.
+// Byte enables are preserved for SB / SH / SW.
+//
+// ----------------------------------------------------------------------------
+// RESET
+// ----------------------------------------------------------------------------
+// Fully synchronous.  This module receives the already-synchronised `reset`
+// from hpu_top; it does not contain its own reset synchroniser.
+//
+// ----------------------------------------------------------------------------
+// F-04
+// ----------------------------------------------------------------------------
+// The funct7 field is deliberately not declared, because no implemented
+// instruction needs it.  Where a funct7 bit is required (ADD/SUB, SRLI/SRAI,
+// SRL/SRA) the decoder reads instruction[30] directly.
 // ============================================================================
 
-(* keep_hierarchy = "yes" *)
-module hpu_cpu(
+module hpu_cpu
+(
     input  wire        clk,
     input  wire        reset,
 
-    output reg  [31:0] instr_addr,
+    // Instruction interface
+    output wire [31:0] instr_addr,
     input  wire [31:0] instr_data,
 
+    // Data interface
     output reg  [31:0] data_addr,
     output reg  [31:0] data_wdata,
     output reg  [3:0]  data_we,
     output reg         data_req,
+
     input  wire [31:0] data_rdata
 );
 
-    localparam [3:0]
-        STATE_FETCH       = 4'd0,
-        STATE_FETCH_WAIT1 = 4'd1,
-        STATE_FETCH_WAIT2 = 4'd2,
-        STATE_DECODE      = 4'd3,
-        STATE_ALU         = 4'd4,
-        STATE_MEM_READ    = 4'd5,
-        STATE_MEM_WAIT1   = 4'd6,
-        STATE_MEM_WAIT2   = 4'd7,
-        STATE_MEM_CAPTURE = 4'd8,
-        STATE_MEM_WRITE   = 4'd9,
-        STATE_MEM_DONE    = 4'd10,
-        STATE_WRITEBACK   = 4'd11;
+
+    // =========================================================================
+    // STATES
+    // =========================================================================
+
+    localparam STATE_FETCH       = 4'd0;
+    localparam STATE_DECODE      = 4'd1;
+    localparam STATE_ALU         = 4'd2;
+    localparam STATE_MEM_READ    = 4'd3;
+    localparam STATE_MEM_CAPTURE = 4'd4;
+    localparam STATE_MEM_WRITE   = 4'd5;
+    localparam STATE_MEM_DONE    = 4'd6;
+    localparam STATE_WRITEBACK   = 4'd7;
 
 
     reg [3:0] state;
 
+
+    // =========================================================================
+    // INTERNAL REGISTERS
+    // =========================================================================
+
     reg [31:0] pc;
     reg [31:0] instruction;
 
+    // Combinational instruction address: valid for a full clock cycle so a
+    // synchronous (Block RAM) instruction memory can present the word in
+    // the following cycle, exactly when DECODE samples it.
+    assign instr_addr = pc;
 
-    // ------------------------------------------------------------------------
-    // Register file
-    //
-    // Deliberately FF based.
-    //
-    // DO NOT convert this to LUTRAM.
-    // LUT resources are being reserved for the future HPU compute fabric.
-    // ------------------------------------------------------------------------
-
-    // x0 is architecturally hard-wired to zero, so it has no physical
-    // storage. Only x1..x31 are implemented.
-    (* ram_style = "registers" *)
-    reg [31:0] registers [1:31];
-
+    reg [31:0] registers [0:31];
 
     reg [31:0] alu_result;
     reg [31:0] memory_result;
 
     reg [4:0] destination_register;
     reg [2:0] memory_funct3;
+
     reg [1:0] memory_offset;
-    reg       load_operation;
+
+    reg load_operation;
 
     integer i;
 
 
-    // ------------------------------------------------------------------------
-    // Instruction fields
-    // ------------------------------------------------------------------------
+    // =========================================================================
+    // INSTRUCTION FIELDS
+    // =========================================================================
 
-    wire [6:0] opcode = instruction[6:0];
+    wire [6:0] opcode;
+    wire [4:0] rd;
+    wire [2:0] funct3;
+    wire [4:0] rs1;
+    wire [4:0] rs2;
 
-    wire [4:0] rd     = instruction[11:7];
-
-    wire [2:0] funct3 = instruction[14:12];
-
-    wire [4:0] rs1    = instruction[19:15];
-
-    wire [4:0] rs2    = instruction[24:20];
-
-
-    // ------------------------------------------------------------------------
-    // Register reads
-    // ------------------------------------------------------------------------
-
-    wire [31:0] rs1_value =
-        (rs1 == 5'd0) ?
-        32'd0 :
-        registers[rs1];
-
-    wire [31:0] rs2_value =
-        (rs2 == 5'd0) ?
-        32'd0 :
-        registers[rs2];
+    // NOTE: funct7 is intentionally not declared.  It was previously decoded
+    // but never used (Verilator -Wall UNUSEDSIGNAL).  Re-introduce it only
+    // when an instruction actually needs it (e.g. a future M-extension).
+    assign opcode = instruction[6:0];
+    assign rd     = instruction[11:7];
+    assign funct3 = instruction[14:12];
+    assign rs1    = instruction[19:15];
+    assign rs2    = instruction[24:20];
 
 
-    // ------------------------------------------------------------------------
-    // Immediate generation
-    // ------------------------------------------------------------------------
+    // =========================================================================
+    // REGISTER READ
+    // =========================================================================
 
-    wire [31:0] immediate_i =
-        {{20{instruction[31]}},
-         instruction[31:20]};
+    wire [31:0] rs1_value;
+    wire [31:0] rs2_value;
 
-    wire [31:0] immediate_s =
-        {{20{instruction[31]}},
-         instruction[31:25],
-         instruction[11:7]};
+    assign rs1_value =
+        (rs1 == 5'd0) ? 32'd0 : registers[rs1];
 
-    wire [31:0] immediate_b =
-        {
-            {19{instruction[31]}},
-            instruction[31],
-            instruction[7],
-            instruction[30:25],
-            instruction[11:8],
-            1'b0
-        };
-
-    wire [31:0] immediate_u =
-        {
-            instruction[31:12],
-            12'b0
-        };
-
-    wire [31:0] immediate_j =
-        {
-            {11{instruction[31]}},
-            instruction[31],
-            instruction[19:12],
-            instruction[20],
-            instruction[30:21],
-            1'b0
-        };
+    assign rs2_value =
+        (rs2 == 5'd0) ? 32'd0 : registers[rs2];
 
 
-    // ------------------------------------------------------------------------
-    // Effective addresses
-    // ------------------------------------------------------------------------
+    // =========================================================================
+    // IMMEDIATES
+    // =========================================================================
 
-    wire [31:0] load_effective_address =
+    wire [31:0] immediate_i;
+    wire [31:0] immediate_s;
+    wire [31:0] immediate_b;
+    wire [31:0] immediate_u;
+    wire [31:0] immediate_j;
+
+
+    assign immediate_i =
+    {
+        {20{instruction[31]}},
+        instruction[31:20]
+    };
+
+
+    assign immediate_s =
+    {
+        {20{instruction[31]}},
+        instruction[31:25],
+        instruction[11:7]
+    };
+
+
+    assign immediate_b =
+    {
+        {19{instruction[31]}},
+        instruction[31],
+        instruction[7],
+        instruction[30:25],
+        instruction[11:8],
+        1'b0
+    };
+
+
+    assign immediate_u =
+    {
+        instruction[31:12],
+        12'b0
+    };
+
+
+    assign immediate_j =
+    {
+        {11{instruction[31]}},
+        instruction[31],
+        instruction[19:12],
+        instruction[20],
+        instruction[30:21],
+        1'b0
+    };
+
+
+    // =========================================================================
+    // EFFECTIVE MEMORY ADDRESSES
+    // =========================================================================
+
+    wire [31:0] load_effective_address;
+    wire [31:0] store_effective_address;
+
+    assign load_effective_address =
         rs1_value + immediate_i;
 
-    wire [31:0] store_effective_address =
+    assign store_effective_address =
         rs1_value + immediate_s;
 
 
-    // ------------------------------------------------------------------------
-    // Sign extension helpers
-    // ------------------------------------------------------------------------
+    // =========================================================================
+    // SIGN EXTENSION FUNCTIONS
+    // =========================================================================
 
     function [31:0] sign_extend_byte;
+
         input [7:0] value;
 
         begin
+
             sign_extend_byte =
-                {{24{value[7]}}, value};
+            {
+                {24{value[7]}},
+                value
+            };
+
         end
+
     endfunction
 
 
     function [31:0] sign_extend_half;
+
         input [15:0] value;
 
         begin
+
             sign_extend_half =
-                {{16{value[15]}}, value};
+            {
+                {16{value[15]}},
+                value
+            };
+
         end
+
     endfunction
 
 
-    // ------------------------------------------------------------------------
-    // CPU FSM
-    // ------------------------------------------------------------------------
+    // =========================================================================
+    // CPU STATE MACHINE
+    // =========================================================================
 
-    always @(posedge clk) begin
+    always @(posedge clk)
+    begin
 
-        if (reset) begin
+        if (reset)
+        begin
 
-            pc                    <= 32'd0;
-            instruction           <= 32'h0000_0013;
+            pc <= 32'd0;
 
-            instr_addr            <= 32'd0;
+            instruction <= 32'h00000013;
 
-            data_addr             <= 32'd0;
-            data_wdata            <= 32'd0;
-            data_we              <= 4'b0000;
-            data_req             <= 1'b0;
 
-            alu_result            <= 32'd0;
-            memory_result         <= 32'd0;
+            data_addr <= 32'd0;
+            data_wdata <= 32'd0;
+            data_we <= 4'b0000;
+            data_req <= 1'b0;
 
-            destination_register  <= 5'd0;
-            memory_funct3         <= 3'd0;
-            memory_offset         <= 2'd0;
+            alu_result <= 32'd0;
+            memory_result <= 32'd0;
 
-            load_operation        <= 1'b0;
+            destination_register <= 5'd0;
+            memory_funct3 <= 3'd0;
+            memory_offset <= 2'd0;
 
-            for (i = 1; i < 32; i = i + 1)
-                registers[i] <= 32'd0;
+            load_operation <= 1'b0;
 
             state <= STATE_FETCH;
 
+
+            for (i = 0; i < 32; i = i + 1)
+            begin
+
+                registers[i] <= 32'd0;
+
+            end
+
         end
 
-        else begin
+        else
+        begin
+
+            // x0 is permanently zero
+            registers[0] <= 32'd0;
+
 
             case (state)
 
-                // ============================================================
+
+                // =============================================================
                 // FETCH
-                // ============================================================
+                // =============================================================
 
-                STATE_FETCH: begin
-
-                    instr_addr <= pc;
+                STATE_FETCH:
+                begin
 
                     data_req <= 1'b0;
-                    data_we  <= 4'b0000;
+                    data_we <= 4'b0000;
 
-                    state <= STATE_FETCH_WAIT1;
-
-                end
-
-
-                STATE_FETCH_WAIT1: begin
-                    data_req <= 1'b0;
-                    data_we  <= 4'b0000;
-                    state <= STATE_FETCH_WAIT2;
-                end
-
-
-                STATE_FETCH_WAIT2: begin
-                    data_req <= 1'b0;
-                    data_we  <= 4'b0000;
                     state <= STATE_DECODE;
+
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // DECODE
-                // ============================================================
+                // =============================================================
 
-                STATE_DECODE: begin
+                STATE_DECODE:
+                begin
 
                     instruction <= instr_data;
 
@@ -560,19 +969,22 @@ module hpu_cpu(
                 end
 
 
-                // ============================================================
-                // EXECUTE / ALU
-                // ============================================================
+                // =============================================================
+                // EXECUTE
+                // =============================================================
 
-                STATE_ALU: begin
+                STATE_ALU:
+                begin
 
                     case (opcode)
 
-                        // ----------------------------------------------------
-                        // LUI
-                        // ----------------------------------------------------
 
-                        7'b0110111: begin
+                        // -----------------------------------------------------
+                        // LUI
+                        // -----------------------------------------------------
+
+                        7'b0110111:
+                        begin
 
                             if (rd != 5'd0)
                                 registers[rd] <= immediate_u;
@@ -582,11 +994,12 @@ module hpu_cpu(
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // AUIPC
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b0010111: begin
+                        7'b0010111:
+                        begin
 
                             if (rd != 5'd0)
                                 registers[rd] <=
@@ -597,142 +1010,242 @@ module hpu_cpu(
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // OP-IMM
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b0010011: begin
+                        7'b0010011:
+                        begin
 
                             destination_register <= rd;
                             load_operation <= 1'b0;
 
+
                             case (funct3)
 
+                                // ADDI
                                 3'b000:
                                     alu_result <=
                                         rs1_value + immediate_i;
 
+
+                                // SLTI
                                 3'b010:
-                                    alu_result <=
-                                        ($signed(rs1_value) <
-                                         $signed(immediate_i))
-                                        ? 32'd1 : 32'd0;
+                                begin
 
+                                    if ($signed(rs1_value) <
+                                        $signed(immediate_i))
+
+                                        alu_result <= 32'd1;
+
+                                    else
+
+                                        alu_result <= 32'd0;
+
+                                end
+
+
+                                // SLTIU
                                 3'b011:
-                                    alu_result <=
-                                        (rs1_value < immediate_i)
-                                        ? 32'd1 : 32'd0;
+                                begin
 
+                                    if (rs1_value < immediate_i)
+
+                                        alu_result <= 32'd1;
+
+                                    else
+
+                                        alu_result <= 32'd0;
+
+                                end
+
+
+                                // XORI
                                 3'b100:
                                     alu_result <=
                                         rs1_value ^ immediate_i;
 
+
+                                // ORI
                                 3'b110:
                                     alu_result <=
                                         rs1_value | immediate_i;
 
+
+                                // ANDI
                                 3'b111:
                                     alu_result <=
                                         rs1_value & immediate_i;
 
+
+                                // SLLI
                                 3'b001:
                                     alu_result <=
                                         rs1_value <<
                                         instruction[24:20];
 
+
+                                // SRLI / SRAI
                                 3'b101:
-                                    alu_result <=
-                                        instruction[30]
-                                        ? ($signed(rs1_value) >>>
-                                           instruction[24:20])
-                                        : (rs1_value >>
-                                           instruction[24:20]);
+                                begin
+
+                                    if (instruction[30])
+
+                                        alu_result <=
+                                            $signed(rs1_value) >>>
+                                            instruction[24:20];
+
+                                    else
+
+                                        alu_result <=
+                                            rs1_value >>
+                                            instruction[24:20];
+
+                                end
+
 
                                 default:
                                     alu_result <= 32'd0;
 
                             endcase
 
+
                             state <= STATE_WRITEBACK;
 
                         end
 
 
-                        // ----------------------------------------------------
-                        // OP
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
+                        // REGISTER ALU
+                        // -----------------------------------------------------
 
-                        7'b0110011: begin
+                        7'b0110011:
+                        begin
 
                             destination_register <= rd;
                             load_operation <= 1'b0;
 
+
                             case (funct3)
 
+                                // ADD / SUB
                                 3'b000:
-                                    alu_result <=
-                                        instruction[30]
-                                        ? (rs1_value - rs2_value)
-                                        : (rs1_value + rs2_value);
+                                begin
 
+                                    if (instruction[30])
+
+                                        alu_result <=
+                                            rs1_value - rs2_value;
+
+                                    else
+
+                                        alu_result <=
+                                            rs1_value + rs2_value;
+
+                                end
+
+
+                                // SLL
                                 3'b001:
                                     alu_result <=
                                         rs1_value <<
                                         rs2_value[4:0];
 
+
+                                // SLT
                                 3'b010:
-                                    alu_result <=
-                                        ($signed(rs1_value) <
-                                         $signed(rs2_value))
-                                        ? 32'd1 : 32'd0;
+                                begin
 
+                                    if ($signed(rs1_value) <
+                                        $signed(rs2_value))
+
+                                        alu_result <= 32'd1;
+
+                                    else
+
+                                        alu_result <= 32'd0;
+
+                                end
+
+
+                                // SLTU
                                 3'b011:
-                                    alu_result <=
-                                        (rs1_value < rs2_value)
-                                        ? 32'd1 : 32'd0;
+                                begin
 
+                                    if (rs1_value < rs2_value)
+
+                                        alu_result <= 32'd1;
+
+                                    else
+
+                                        alu_result <= 32'd0;
+
+                                end
+
+
+                                // XOR
                                 3'b100:
                                     alu_result <=
                                         rs1_value ^ rs2_value;
 
-                                3'b101:
-                                    alu_result <=
-                                        instruction[30]
-                                        ? ($signed(rs1_value) >>>
-                                           rs2_value[4:0])
-                                        : (rs1_value >>
-                                           rs2_value[4:0]);
 
+                                // SRL / SRA
+                                3'b101:
+                                begin
+
+                                    if (instruction[30])
+
+                                        alu_result <=
+                                            $signed(rs1_value) >>>
+                                            rs2_value[4:0];
+
+                                    else
+
+                                        alu_result <=
+                                            rs1_value >>
+                                            rs2_value[4:0];
+
+                                end
+
+
+                                // OR
                                 3'b110:
                                     alu_result <=
                                         rs1_value | rs2_value;
 
+
+                                // AND
                                 3'b111:
                                     alu_result <=
                                         rs1_value & rs2_value;
+
 
                                 default:
                                     alu_result <= 32'd0;
 
                             endcase
 
+
                             state <= STATE_WRITEBACK;
 
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // LOAD
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b0000011: begin
+                        7'b0000011:
+                        begin
 
+                            // Align address to 32-bit word boundary
                             data_addr <=
-                                {
-                                    load_effective_address[31:2],
-                                    2'b00
-                                };
+                            {
+                                load_effective_address[31:2],
+                                2'b00
+                            };
 
+                            // Preserve original byte position
                             memory_offset <=
                                 load_effective_address[1:0];
 
@@ -751,18 +1264,21 @@ module hpu_cpu(
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // STORE
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b0100011: begin
+                        7'b0100011:
+                        begin
 
+                            // Align address to word boundary
                             data_addr <=
-                                {
-                                    store_effective_address[31:2],
-                                    2'b00
-                                };
+                            {
+                                store_effective_address[31:2],
+                                2'b00
+                            };
 
+                            // Save byte offset
                             memory_offset <=
                                 store_effective_address[1:0];
 
@@ -775,32 +1291,45 @@ module hpu_cpu(
 
                             case (funct3)
 
+
                                 // SB
-                                3'b000: begin
+                                3'b000:
+                                begin
 
                                     case (store_effective_address[1:0])
 
                                         2'b00:
                                             data_wdata <=
-                                                {24'd0,
-                                                 rs2_value[7:0]};
+                                            {
+                                                24'd0,
+                                                rs2_value[7:0]
+                                            };
+
 
                                         2'b01:
                                             data_wdata <=
-                                                {16'd0,
-                                                 rs2_value[7:0],
-                                                 8'd0};
+                                            {
+                                                16'd0,
+                                                rs2_value[7:0],
+                                                8'd0
+                                            };
+
 
                                         2'b10:
                                             data_wdata <=
-                                                {8'd0,
-                                                 rs2_value[7:0],
-                                                 16'd0};
+                                            {
+                                                8'd0,
+                                                rs2_value[7:0],
+                                                16'd0
+                                            };
+
 
                                         2'b11:
                                             data_wdata <=
-                                                {rs2_value[7:0],
-                                                 24'd0};
+                                            {
+                                                rs2_value[7:0],
+                                                24'd0
+                                            };
 
                                     endcase
 
@@ -808,19 +1337,36 @@ module hpu_cpu(
 
 
                                 // SH
-                                3'b001: begin
+                                3'b001:
+                                begin
 
-                                    data_wdata <=
-                                        store_effective_address[1]
-                                        ? {rs2_value[15:0],16'd0}
-                                        : {16'd0,rs2_value[15:0]};
+                                    if (store_effective_address[1])
+
+                                        data_wdata <=
+                                        {
+                                            rs2_value[15:0],
+                                            16'd0
+                                        };
+
+                                    else
+
+                                        data_wdata <=
+                                        {
+                                            16'd0,
+                                            rs2_value[15:0]
+                                        };
 
                                 end
 
 
                                 // SW
                                 3'b010:
-                                    data_wdata <= rs2_value;
+                                begin
+
+                                    data_wdata <=
+                                        rs2_value;
+
+                                end
 
 
                                 default:
@@ -828,72 +1374,119 @@ module hpu_cpu(
 
                             endcase
 
+
                             state <= STATE_MEM_WRITE;
 
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // BRANCH
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b1100011: begin
+                        7'b1100011:
+                        begin
 
                             case (funct3)
 
+                                // BEQ
                                 3'b000:
+                                begin
+
                                     if (rs1_value == rs2_value)
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
 
+                                end
+
+
+                                // BNE
                                 3'b001:
+                                begin
+
                                     if (rs1_value != rs2_value)
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
 
+                                end
+
+
+                                // BLT
                                 3'b100:
+                                begin
+
                                     if ($signed(rs1_value) <
                                         $signed(rs2_value))
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
 
+                                end
+
+
+                                // BGE
                                 3'b101:
+                                begin
+
                                     if ($signed(rs1_value) >=
                                         $signed(rs2_value))
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
 
+                                end
+
+
+                                // BLTU
                                 3'b110:
+                                begin
+
                                     if (rs1_value < rs2_value)
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
 
+                                end
+
+
+                                // BGEU
                                 3'b111:
+                                begin
+
                                     if (rs1_value >= rs2_value)
+
                                         pc <=
                                             (pc - 32'd4) +
                                             immediate_b;
+
+                                end
+
 
                                 default:
-                                    ;
+                                begin
+                                end
 
                             endcase
+
 
                             state <= STATE_FETCH;
 
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // JAL
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b1101111: begin
+                        7'b1101111:
+                        begin
 
                             if (rd != 5'd0)
                                 registers[rd] <= pc;
@@ -907,78 +1500,78 @@ module hpu_cpu(
                         end
 
 
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
                         // JALR
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
 
-                        7'b1100111: begin
+                        7'b1100111:
+                        begin
 
                             if (rd != 5'd0)
                                 registers[rd] <= pc;
 
                             pc <=
-                                (rs1_value + immediate_i) &
-                                32'hFFFF_FFFE;
+                            (
+                                rs1_value + immediate_i
+                            )
+                            &
+                            32'hFFFF_FFFE;
 
                             state <= STATE_FETCH;
 
                         end
 
 
-                        // ----------------------------------------------------
-                        // Unsupported instruction
-                        // ----------------------------------------------------
+                        // -----------------------------------------------------
+                        // UNKNOWN / NOP
+                        // -----------------------------------------------------
 
                         default:
+                        begin
+
                             state <= STATE_FETCH;
+
+                        end
 
                     endcase
 
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // MEMORY READ
-                // ============================================================
+                // =============================================================
 
-                STATE_MEM_READ: begin
+                STATE_MEM_READ:
+                begin
 
                     data_req <= 1'b1;
-                    data_we  <= 4'b0000;
 
-                    state <= STATE_MEM_WAIT1;
+                    data_we <= 4'b0000;
 
-                end
-
-
-                STATE_MEM_WAIT1: begin
-                    data_req <= 1'b1;
-                    data_we  <= 4'b0000;
-                    state <= STATE_MEM_WAIT2;
-                end
-
-
-                STATE_MEM_WAIT2: begin
-                    data_req <= 1'b1;
-                    data_we  <= 4'b0000;
                     state <= STATE_MEM_CAPTURE;
+
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // MEMORY CAPTURE
-                // ============================================================
+                // =============================================================
 
-                STATE_MEM_CAPTURE: begin
+                STATE_MEM_CAPTURE:
+                begin
 
                     data_req <= 1'b0;
-                    data_we  <= 4'b0000;
+
+                    data_we <= 4'b0000;
 
 
                     case (memory_funct3)
 
+
                         // LB
-                        3'b000: begin
+                        3'b000:
+                        begin
 
                             case (memory_offset)
 
@@ -1013,43 +1606,68 @@ module hpu_cpu(
 
                         // LH
                         3'b001:
-                            memory_result <=
-                                memory_offset[1]
-                                ? sign_extend_half(
-                                      data_rdata[31:16])
-                                : sign_extend_half(
-                                      data_rdata[15:0]);
+                        begin
+
+                            if (memory_offset[1])
+
+                                memory_result <=
+                                    sign_extend_half(
+                                        data_rdata[31:16]
+                                    );
+
+                            else
+
+                                memory_result <=
+                                    sign_extend_half(
+                                        data_rdata[15:0]
+                                    );
+
+                        end
 
 
                         // LW
                         3'b010:
-                            memory_result <= data_rdata;
+                        begin
+
+                            memory_result <=
+                                data_rdata;
+
+                        end
 
 
                         // LBU
-                        3'b100: begin
+                        3'b100:
+                        begin
 
                             case (memory_offset)
 
                                 2'b00:
                                     memory_result <=
-                                        {24'd0,
-                                         data_rdata[7:0]};
+                                    {
+                                        24'd0,
+                                        data_rdata[7:0]
+                                    };
 
                                 2'b01:
                                     memory_result <=
-                                        {24'd0,
-                                         data_rdata[15:8]};
+                                    {
+                                        24'd0,
+                                        data_rdata[15:8]
+                                    };
 
                                 2'b10:
                                     memory_result <=
-                                        {24'd0,
-                                         data_rdata[23:16]};
+                                    {
+                                        24'd0,
+                                        data_rdata[23:16]
+                                    };
 
                                 2'b11:
                                     memory_result <=
-                                        {24'd0,
-                                         data_rdata[31:24]};
+                                    {
+                                        24'd0,
+                                        data_rdata[31:24]
+                                    };
 
                             endcase
 
@@ -1058,35 +1676,58 @@ module hpu_cpu(
 
                         // LHU
                         3'b101:
-                            memory_result <=
-                                memory_offset[1]
-                                ? {16'd0,data_rdata[31:16]}
-                                : {16'd0,data_rdata[15:0]};
+                        begin
+
+                            if (memory_offset[1])
+
+                                memory_result <=
+                                {
+                                    16'd0,
+                                    data_rdata[31:16]
+                                };
+
+                            else
+
+                                memory_result <=
+                                {
+                                    16'd0,
+                                    data_rdata[15:0]
+                                };
+
+                        end
 
 
                         default:
+                        begin
+
                             memory_result <= 32'd0;
 
+                        end
+
                     endcase
+
 
                     state <= STATE_WRITEBACK;
 
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // MEMORY WRITE
-                // ============================================================
+                // =============================================================
 
-                STATE_MEM_WRITE: begin
+                STATE_MEM_WRITE:
+                begin
 
                     data_req <= 1'b1;
 
 
                     case (memory_funct3)
 
+
                         // SB
-                        3'b000: begin
+                        3'b000:
+                        begin
 
                             case (memory_offset)
 
@@ -1109,53 +1750,81 @@ module hpu_cpu(
 
                         // SH
                         3'b001:
-                            data_we <=
-                                memory_offset[1]
-                                ? 4'b1100
-                                : 4'b0011;
+                        begin
+
+                            if (memory_offset[1])
+
+                                data_we <= 4'b1100;
+
+                            else
+
+                                data_we <= 4'b0011;
+
+                        end
 
 
                         // SW
                         3'b010:
+                        begin
+
                             data_we <= 4'b1111;
+
+                        end
 
 
                         default:
+                        begin
+
                             data_we <= 4'b0000;
 
+                        end
+
                     endcase
+
 
                     state <= STATE_MEM_DONE;
 
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // MEMORY DONE
-                // ============================================================
+                // =============================================================
 
-                STATE_MEM_DONE: begin
+                STATE_MEM_DONE:
+                begin
 
                     data_req <= 1'b0;
-                    data_we  <= 4'b0000;
+
+                    data_we <= 4'b0000;
 
                     state <= STATE_FETCH;
 
                 end
 
 
-                // ============================================================
+                // =============================================================
                 // WRITEBACK
-                // ============================================================
+                // =============================================================
 
-                STATE_WRITEBACK: begin
+                STATE_WRITEBACK:
+                begin
 
                     if (destination_register != 5'd0)
+                    begin
 
-                        registers[destination_register] <=
-                            load_operation
-                            ? memory_result
-                            : alu_result;
+                        if (load_operation)
+
+                            registers[destination_register] <=
+                                memory_result;
+
+                        else
+
+                            registers[destination_register] <=
+                                alu_result;
+
+                    end
+
 
                     load_operation <= 1'b0;
 
@@ -1164,12 +1833,17 @@ module hpu_cpu(
                 end
 
 
-                // ============================================================
-                // RECOVERY
-                // ============================================================
+                // =============================================================
+                // DEFAULT
+                // =============================================================
 
                 default:
+                begin
+
                     state <= STATE_FETCH;
+
+                end
+
 
             endcase
 
@@ -1177,404 +1851,2359 @@ module hpu_cpu(
 
     end
 
+
 endmodule
 
 
-
 // ============================================================================
-// SMALL BOOT ROM
-//
-// 24 actual program words.
-// Everything else is NOP.
-//
-// No large synthesizable memory array.
-// Therefore this does NOT become 16K x 32 LUTRAM.
+// END OF MODULE: hpu_cpu
 // ============================================================================
 
-module boot_rom(
-    input  wire [5:0] instr_word_addr,
-    output reg  [31:0] instr_rdata,
+`timescale 1ns / 1ps
+// ============================================================================
+// PHASE 1 - ADAPTIVE-PRECISION COMPUTE ENGINE
+//
+// Target Board:
+// Digilent Nexys A7-100T
+// FPGA:
+// Xilinx Artix-7 XC7A100T-1CSG324C
+//
+// Language:
+// Verilog-2001
+//
+// ----------------------------------------------------------------------------
+// WHAT THIS MODULE IS
+// ----------------------------------------------------------------------------
+// The first accelerator in the HPU fabric: one compute engine that processes
+// the SAME workload at INT8, INT16 or INT32 precision.  The precision is
+// selected by software writing CONFIG.PRECISION.
+//
+// The word "adaptive" here means exactly that, and nothing more:
+//
+//   * Phase 1 : software selects CONFIG.PRECISION.
+//   * Phase 4 : the hardware scheduler writes the SAME register using
+//               deterministic rules.
+//
+// There is no machine learning, no auto-tuning and no run-time discovery
+// anywhere in this module.
+//
+// ----------------------------------------------------------------------------
+// THE CENTRAL ARCHITECTURAL CLAIM
+// ----------------------------------------------------------------------------
+// There is ONE shared datapath: four shared DSP-capable multiplier lanes.
+// The same four physical multiplier resources are reconfigured to serve all
+// three precision modes - this is not three datapaths selected by a mux.
+//
+// Each lane is a signed 18x18 multiply.  18 bits of input (rather than 16) is
+// required because the INT32 decomposition needs signed x unsigned partial
+// products, and an unsigned 16-bit operand must be zero-extended into an 18th
+// bit so that a signed multiplier reads it as a positive value.  18x18 also
+// maps cleanly onto the DSP48E1's 25x18 multiplier port.
+//
+//   INT8  : four 8x8 lane operations      (all four lanes active)
+//   INT16 : two 16x16 lane operations     (lanes 2 and 3 idle)
+//   INT32 : four 16x16 partial products   (all four lanes: p11, p10, p01, p00)
+//
+// No claim is made that these infer DSP48E1 blocks.  They are written as
+// plain signed multiplies, which are DSP-capable.  Actual inference is a
+// Vivado measurement, not an RTL assertion.
+//
+// ----------------------------------------------------------------------------
+// PARAMETERIZATION
+// ----------------------------------------------------------------------------
+// This module has NO parameters.  The architecture is "4 shared multiplier
+// lanes -> INT8 / INT16 / INT32" and nothing else.  Every constant is a
+// localparam.  See docs/04_phase1_implementation_contract.md section 4.
+//
+// ----------------------------------------------------------------------------
+// OPERAND TIMING  (hard correctness requirement)
+// ----------------------------------------------------------------------------
+// The operand source is synchronous:
+//
+//     address stable during cycle N
+//  -> rdata and valid describe that address during cycle N+1
+//  -> the core consumes them during cycle N+1
+//
+// The core presents an address and consumes the resulting data one clock
+// later.  It NEVER consumes data in the same clock it presents an address.
+// Alignment is carried by two registers:
+//
+//     pending     : set on the clock that presents a new address
+//     data_ready  : the one-clock-delayed copy of pending
+//
+// Data is consumed only when  data_ready && opa_valid && opb_valid.
+// The address only advances once that data has been consumed, so a
+// stalled source (opa_valid / opb_valid low) holds the pending word.
+// If a Phase-3 arbiter de-asserts opa_valid / opb_valid the core stalls,
+// holding the address and retrying.  No core change is needed in Phase 3.
+//
+// ----------------------------------------------------------------------------
+// MEMORY MAP
+// ----------------------------------------------------------------------------
+//   0x5000_0000 - 0x5000_0FFF : register block  (see REGISTER INDEXES)
+//   0x5000_1000 - 0x5000_1FFF : operand window  (1024 x 32 local RAM)
+//                               words   0-511 = vector A
+//                               words 512-1023 = vector B
+//
+// ----------------------------------------------------------------------------
+// BUS PROTOCOL
+// ----------------------------------------------------------------------------
+// Every register captures in ONE clock, on the edge where the CPU asserts
+// data_req with a non-zero data_we.  No ready/valid handshake and no wait
+// states are added: the CPU transaction is never stretched.  The CPU polls
+// STATUS.DONE / STATUS.BUSY, exactly as the contract requires.
+// ============================================================================
 
-    input  wire [5:0] data_word_addr,
-    output reg  [31:0] data_rdata
+module hpu_compute_engine
+(
+    input  wire        clk,
+    input  wire        reset,
+
+    // ------------------------------------------------------------------------
+    // CPU REGISTER-BLOCK INTERFACE  (0x5000_0xxx)
+    // ------------------------------------------------------------------------
+
+    input  wire        reg_select,      // data_req && ce_reg_select
+    input  wire [5:0]  reg_addr,        // data_addr[7:2]
+    input  wire [31:0] reg_wdata,
+    input  wire [3:0]  reg_we,          // byte enables, already gated
+
+    output reg  [31:0] reg_rdata,
+
+    // ------------------------------------------------------------------------
+    // CPU OPERAND-WINDOW INTERFACE  (0x5000_1xxx) - honoured only when idle
+    // ------------------------------------------------------------------------
+
+    input  wire        mem_select,      // data_req && ce_mem_select
+    input  wire [9:0]  mem_addr,        // data_addr[11:2]
+    input  wire [31:0] mem_wdata,
+    input  wire [3:0]  mem_we,          // byte enables, already gated
+
+    output reg  [31:0] mem_rdata,
+
+    // ------------------------------------------------------------------------
+    // OPERAND SOURCE  (Phase 1: local operand_ram.  Phase 3: shared_memory)
+    //
+    // Port 0 is time-shared: the CPU owns it while the engine is idle, the
+    // engine owns it while the engine is running.  Port 1 is always the
+    // engine's B-vector fetch.
+    // ------------------------------------------------------------------------
+
+    output wire [9:0]  opa_addr,
+    output wire [31:0] opa_wdata,
+    output wire [3:0]  opa_we,
+
+    input  wire [31:0] opa_rdata,
+    input  wire        opa_valid,
+
+    output wire [9:0]  opb_addr,
+
+    input  wire [31:0] opb_rdata,
+    input  wire        opb_valid
 );
+//
+// NOTE: busy is an internal signal, not a module port.  Nothing outside the
+// engine consumes it in Phase 1 - software observes it through STATUS.BUSY,
+// which is the documented polling mechanism.  A port that no parent connects
+// would be a lint violation, so it is deliberately not exported.  Phase 4
+// (the hardware scheduler) can re-add it together with its consumer.
 
-    function [31:0] boot_word;
 
-        input [5:0] addr;
+    // ========================================================================
+    // ARCHITECTURE CONSTANTS  (fixed - deliberately not parameters)
+    // ========================================================================
 
+    localparam LANES          = 4;      // four shared multiplier lanes
+    localparam LANE_IN_W      = 18;     // signed multiplier input width
+
+    // The operand window is 1024 words (see operand_ram.v); half of it is
+    // vector A and half is vector B, so one vector is 512 words.
+    localparam OPERAND_ADDR_W = 10;
+    localparam VECTOR_WORDS   = 512;    // per-vector capacity
+
+    localparam [OPERAND_ADDR_W-1:0] BASE_A = 10'd0;
+    localparam [OPERAND_ADDR_W-1:0] BASE_B = VECTOR_WORDS[OPERAND_ADDR_W-1:0];
+
+    // Precision encoding - CONFIG[1:0]
+    localparam [1:0] PREC_INT8  = 2'b00;
+    localparam [1:0] PREC_INT16 = 2'b01;
+    localparam [1:0] PREC_INT32 = 2'b10;
+    // 2'b11 is reserved and is rejected.
+
+    // Opcode encoding - CONFIG[6:4]
+    localparam [2:0] OP_DOT = 3'b000;   // vector dot product (accumulating)
+    localparam [2:0] OP_MAC = 3'b001;   // scalar multiply-accumulate
+    localparam [2:0] OP_MUL = 3'b010;   // scalar multiply (overwrite)
+    localparam [2:0] OP_ADD = 3'b011;   // scalar add (overwrite)
+    localparam [2:0] OP_SUB = 3'b100;   // scalar subtract (overwrite)
+    localparam [2:0] OP_NOP = 3'b101;   // no data processing (ACC_CLEAR only)
+    // 3'b110 and 3'b111 are reserved and are rejected.
+
+    // FSM states
+    localparam [1:0] S_IDLE = 2'd0;
+    localparam [1:0] S_RUN  = 2'd1;     // vector: DOT
+    localparam [1:0] S_EXEC = 2'd2;     // scalar: MAC / MUL / ADD / SUB / NOP
+
+    // Register-block word indexes - data_addr[7:2]
+    localparam [5:0] IDX_CTRL      = 6'd0;    // 0x00  WO
+    localparam [5:0] IDX_STATUS    = 6'd1;    // 0x04  RO
+    localparam [5:0] IDX_CONFIG    = 6'd2;    // 0x08  RW
+    localparam [5:0] IDX_LENGTH    = 6'd3;    // 0x0C  RW
+    localparam [5:0] IDX_OPERAND_A = 6'd4;    // 0x10  RW
+    localparam [5:0] IDX_OPERAND_B = 6'd5;    // 0x14  RW
+    localparam [5:0] IDX_RESULT_LO = 6'd6;    // 0x18  RO
+    localparam [5:0] IDX_RESULT_HI = 6'd7;    // 0x1C  RO
+    localparam [5:0] IDX_ACC_LO    = 6'd8;    // 0x20  WO (preload)
+    localparam [5:0] IDX_ACC_HI    = 6'd9;    // 0x24  WO (preload)
+    localparam [5:0] IDX_CYCLE_CNT = 6'd10;   // 0x28  RO
+    localparam [5:0] IDX_ELEM_CNT  = 6'd11;   // 0x2C  RO
+
+    // CTRL bit positions
+    localparam CTRL_START     = 0;
+    localparam CTRL_ACC_CLEAR = 1;
+
+    // STATUS bit positions
+    localparam STAT_BUSY = 0;
+    localparam STAT_DONE = 1;
+    localparam STAT_OVF  = 2;
+    localparam STAT_ERR  = 3;
+
+
+    // ========================================================================
+    // STATE
+    // ========================================================================
+
+    reg [1:0]  state;
+
+    reg [63:0] acc;                 // the one and only accumulator
+
+    reg [31:0] config_reg;          // [1:0] precision, [6:4] opcode, [7] sat
+    reg [11:0] length_reg;
+    reg [31:0] operand_a;
+    reg [31:0] operand_b;
+
+    reg        done_flag;
+    reg        err_flag;
+    reg        ovf_flag;
+
+    reg [OPERAND_ADDR_W-1:0] addr_a;
+    reg [OPERAND_ADDR_W-1:0] addr_b;
+
+    reg [9:0]  fetch_word;          // next word whose address to present
+    reg [9:0]  consume_word;        // index of the word being consumed
+    reg        recovering;          // holding a rewound address after a stall
+
+    // ========================================================================
+    // RESULT PIPELINE CONTROL
+    //
+    // The datapath uses two register stages after the operand word is
+    // presented:
+    //
+    //     stage 2 : prod0..3 / lane_en0..3 / a64,b64
+    //     stage 3 : result_r
+    //
+    // so the accumulator update for a word consumed on clock N must happen on
+    // clock N + 2.  These three shift registers carry the control information
+    // that has to travel with the data:
+    //
+    //     acc_valid_sr  - "a result belonging to a consumed word is here"
+    //     last_word_sr  - "that result belongs to the final word"
+    //     elem_add_d1/2 - the element count that belongs to that word
+    //
+    // RESULT_PIPE_D is the pipeline depth in clocks.  It is used to derive the
+    // latency contract, so it must stay consistent with the datapath.
+    // ========================================================================
+
+    localparam [2:0] RESULT_PIPE_D = 3'd4;
+    // NOTE: lane_a_r/lane_b_r above are an ADDRESS/OPERAND stage that
+    // is already accounted for: the datapath is
+    //   operand -> lane_*_r -> prod*_r -> red_*_r -> result_r -> acc
+    // and RESULT_PIPE_D counts the stages AFTER prod*_r.
+
+    reg [3:0] acc_valid_sr;         // acc_valid_sr[RESULT_PIPE_D-1] == accumulate
+    reg [3:0] last_word_sr;         // last_word_sr[RESULT_PIPE_D-1] == finish
+    reg [2:0] exec_cnt;             // scalar path: clocks spent in S_EXEC
+    reg [2:0] elem_add_d1;
+    reg [2:0] elem_add_d2;
+    reg [2:0] elem_add_d3;
+    reg [2:0] elem_add_d4;
+    reg       draining;             // all words consumed, waiting for the pipe
+
+    reg        pending;
+    reg        data_ready;
+
+    reg [11:0] cycle_cnt;
+    reg [11:0] elem_cnt;
+
+
+    // Engine busy: any state other than idle.  Used for operand-port
+    // arbitration, for gating CPU register writes, and for STATUS.BUSY.
+    wire busy = (state != S_IDLE);
+
+
+    // ========================================================================
+    // DECODED CONFIGURATION
+    // ========================================================================
+
+    wire [1:0] prec     = config_reg[1:0];
+    wire [2:0] opcode   = config_reg[6:4];
+    wire       saturate = config_reg[7];
+
+    wire is_dot = (opcode == OP_DOT);
+
+    // In the scalar state the lane array always performs the full 32x32
+    // decomposition.  That is exact for every precision because the scalar
+    // operands are sign-extended to 32 bits first, so one routing mode covers
+    // INT8, INT16 and INT32 scalars and reuses the same four lanes.
+    wire       in_scalar = (state == S_EXEC);
+    wire [1:0] routing   = in_scalar ? PREC_INT32 : prec;
+
+
+    // ========================================================================
+    // UTILITY FUNCTIONS
+    // ========================================================================
+
+    // Byte-enable merge for MMIO register writes (SB / SH / SW).
+    function [31:0] merge_bytes;
+        input [31:0] old_value;
+        input [31:0] new_value;
+        input [3:0]  byte_enable;
         begin
-
-            case (addr)
-
-                6'd0:
-                    boot_word = 32'h4000_10B7;
-
-                6'd1:
-                    boot_word = 32'h0001_0137;
-
-                6'd2:
-                    boot_word = 32'h1000_0193;
-
-                6'd3:
-                    boot_word = 32'h0550_0213;
-
-                6'd4:
-                    boot_word = 32'h0041_82B3;
-
-                6'd5:
-                    boot_word = 32'h0051_2023;
-
-                6'd6:
-                    boot_word = 32'h0001_2303;
-
-                6'd7:
-                    boot_word = 32'h1550_0393;
-
-                6'd8:
-                    boot_word = 32'h0072_8463;
-
-                6'd9:
-                    boot_word = 32'h02C0_006F;
-
-                6'd10:
-                    boot_word = 32'h0073_0463;
-
-                6'd11:
-                    boot_word = 32'h0240_006F;
-
-                6'd12:
-                    boot_word = 32'h4000_2437;
-
-                6'd13:
-                    boot_word = 32'h0004_2483;
-
-                6'd14:
-                    boot_word = 32'h0004_9463;
-
-                6'd15:
-                    boot_word = 32'h0140_006F;
-
-                6'd16:
-                    boot_word = 32'h0000_C937;
-
-                6'd17:
-                    boot_word = 32'h0DE9_0913;
-
-                6'd18:
-                    boot_word = 32'h0120_A023;
-
-                6'd19:
-                    boot_word = 32'h0000_006F;
-
-                6'd20:
-                    boot_word = 32'h0000_E937;
-
-                6'd21:
-                    boot_word = 32'hEAD9_0913;
-
-                6'd22:
-                    boot_word = 32'h0120_A023;
-
-                6'd23:
-                    boot_word = 32'h0000_006F;
-
-                default:
-                    boot_word = 32'h0000_0013;
-
-            endcase
-
+            merge_bytes[7:0]   = byte_enable[0] ? new_value[7:0]   : old_value[7:0];
+            merge_bytes[15:8]  = byte_enable[1] ? new_value[15:8]  : old_value[15:8];
+            merge_bytes[23:16] = byte_enable[2] ? new_value[23:16] : old_value[23:16];
+            merge_bytes[31:24] = byte_enable[3] ? new_value[31:24] : old_value[31:24];
         end
+    endfunction
 
+    // ------------------------------------------------------------------------
+    // VIVADO COMPATIBILITY  (Synth 8-12513)
+    //
+    // Vivado rejects a bit-select applied directly to a function-call result:
+    //
+    // Applying a range select straight to that call is what Vivado rejects,
+    // so the merged word is formed as a named signal and selected at use site.
+    //
+    // IEEE 1800 requires the operand of a select to be a net or variable
+    // reference, not the value returned by a function call.  The merged
+    // 32-bit word for the LENGTH register is therefore formed here as a
+    // named signal, and the [11:0] range is selected at the point of use.
+    //
+    // The value is bit-for-bit identical to the original expression: the same
+    // function, the same arguments, in the same order, with the same range
+    // selected.  This is a syntax-compatibility change only.
+    // ------------------------------------------------------------------------
+    // LENGTH is 12 bits, so the byte-masked merge is written at its exact
+    // 12-bit width instead of computing 32 bits and discarding the top 20.
+    // Byte enables 2 and 3 address bits the LENGTH register does not have,
+    // which is precisely what the previous 32-bit form did with them.
+    wire [11:0] merged_length_word = { reg_we[1] ? reg_wdata[11:8] : length_reg[11:8],
+                                       reg_we[0] ? reg_wdata[7:0]  : length_reg[7:0]  };
+
+    // Sign-extend a scalar operand to 32 bits according to the precision.
+    function [31:0] sext32;
+        input [31:0] v;
+        input [1:0]  p;
+        begin
+            case (p)
+                PREC_INT8:  sext32 = {{24{v[7]}},  v[7:0]};
+                PREC_INT16: sext32 = {{16{v[15]}}, v[15:0]};
+                default:    sext32 = v;
+            endcase
+        end
+    endfunction
+
+    // Sign-extend a 32-bit scalar operand to 64 bits.
+    function [63:0] sext64;
+        input [31:0] v;
+        input [1:0]  p;
+        begin
+            case (p)
+                PREC_INT8:  sext64 = {{56{v[7]}},  v[7:0]};
+                PREC_INT16: sext64 = {{48{v[15]}}, v[15:0]};
+                default:    sext64 = {{32{v[31]}}, v[31:0]};
+            endcase
+        end
+    endfunction
+
+    // Element index of a lane within a word.  Used for the partial-final-word
+    // lane mask.
+    function [11:0] elem_index;
+        input [11:0] word;
+        input [1:0]  p;
+        input [1:0]  lane;
+        begin
+            case (p)
+                PREC_INT8:  elem_index = (word << 2) + {10'd0, lane};
+                PREC_INT16: elem_index = (word << 1) + {10'd0, lane};
+                default:    elem_index = word;
+            endcase
+        end
+    endfunction
+
+    // Widen a lane product to 64 bits according to the routing mode.
+    function [63:0] ext_prod;
+        input [35:0] p;
+        input [1:0]  mode;
+        begin
+            case (mode)
+                // The 18x18 product is 36 bits.  For both the 8x8 and the
+                // 16x16 case the mathematical result fits well inside it,
+                // so the 36-bit two's-complement result IS the correctly
+                // sign-extended value: widening it to 64 bits is exact and
+                // consumes every bit of the multiplier output.
+                PREC_INT8:  ext_prod = {{28{p[35]}}, p[35:0]};
+                PREC_INT16: ext_prod = {{28{p[35]}}, p[35:0]};
+                default:    ext_prod = 64'd0;   // INT32 uses the recombination
+            endcase
+        end
     endfunction
 
 
-    always @* begin
+    // ========================================================================
+    // CAPACITY AND WORD COUNT
+    // ========================================================================
 
-        instr_rdata = boot_word(instr_word_addr);
-        data_rdata  = boot_word(data_word_addr);
+    // Maximum number of elements a DOT may process, per precision.
+    reg [11:0] capacity;
+    always @*
+    begin
+        case (prec)
+            PREC_INT8:  capacity = VECTOR_WORDS * 12'd4;   // 512 words x 4
+            PREC_INT16: capacity = VECTOR_WORDS * 12'd2;   // 512 words x 2
+            default:    capacity = VECTOR_WORDS * 12'd1;   // 512 words x 1
+        endcase
+    end
+
+    // W = ceil(LENGTH / elements_per_word)
+    reg [9:0] word_count;
+    always @*
+    begin
+        case (prec)
+            PREC_INT8:  word_count = length_reg[11:2] + {9'd0, |length_reg[1:0]};
+            PREC_INT16: word_count = length_reg[10:1] + {9'd0,  length_reg[0]};
+            default:    word_count = length_reg[9:0];
+        endcase
+    end
+
+
+    // ========================================================================
+    // START VALIDATION  (combinational, evaluated at the START clock)
+    // ========================================================================
+
+    wire prec_valid   = (prec != 2'b11);
+    wire opcode_valid = (opcode != 3'b110) && (opcode != 3'b111);
+    wire length_valid = (length_reg != 12'd0) && (length_reg <= capacity);
+
+    wire start_valid = is_dot ? (prec_valid && opcode_valid && length_valid)
+                              : (prec_valid && opcode_valid);
+
+
+    // ========================================================================
+    // THE FOUR SHARED MULTIPLIER LANES
+    // ========================================================================
+
+    // Word pair currently presented to the lane array.
+    wire [31:0] lane_word_a = in_scalar ? sext32(operand_a, prec) : opa_rdata;
+    wire [31:0] lane_word_b = in_scalar ? sext32(operand_b, prec) : opb_rdata;
+
+    reg signed [LANE_IN_W-1:0] lane_a [0:LANES-1];
+    reg signed [LANE_IN_W-1:0] lane_b [0:LANES-1];
+
+    integer k;
+
+    always @*
+    begin
+        for (k = 0; k < LANES; k = k + 1)
+        begin
+            case (routing)
+
+                // ---- INT8 : four independent 8x8 operations ----------------
+                PREC_INT8:
+                begin
+                    lane_a[k] = {{10{lane_word_a[8*k+7]}}, lane_word_a[8*k +: 8]};
+                    lane_b[k] = {{10{lane_word_b[8*k+7]}}, lane_word_b[8*k +: 8]};
+                end
+
+                // ---- INT16 : two independent 16x16 operations --------------
+                // Lanes 2 and 3 are idle in this mode.  That is an honest
+                // consequence of sharing one array rather than replicating
+                // three datapaths.
+                PREC_INT16:
+                begin
+                    lane_a[k] = (k < 2) ?
+                        {{2{lane_word_a[16*k+15]}}, lane_word_a[16*k +: 16]}
+                        : {LANE_IN_W{1'b0}};
+
+                    lane_b[k] = (k < 2) ?
+                        {{2{lane_word_b[16*k+15]}}, lane_word_b[16*k +: 16]}
+                        : {LANE_IN_W{1'b0}};
+                end
+
+                // ---- INT32 / scalar : four 16x16 partial products ----------
+                //   lane 0 : p11 = A1(signed) x B1(signed)
+                //   lane 1 : p10 = A1(signed) x B0(unsigned)
+                //   lane 2 : p01 = A0(unsigned) x B1(signed)
+                //   lane 3 : p00 = A0(unsigned) x B0(unsigned)
+                //
+                // The unsigned operands are ZERO-extended into 18 bits so that
+                // the signed multiplier reads them as positive values.  This
+                // is why the lane input width is 18 and not 16.
+                default:
+                begin
+                    lane_a[k] = (k < 2) ?
+                        {{2{lane_word_a[31]}}, lane_word_a[31:16]}
+                        : {2'b00, lane_word_a[15:0]};
+
+                    lane_b[k] = ((k == 0) || (k == 2)) ?
+                        {{2{lane_word_b[31]}}, lane_word_b[31:16]}
+                        : {2'b00, lane_word_b[15:0]};
+                end
+
+            endcase
+        end
+    end
+
+    // ========================================================================
+    // TIMING PIPELINE - DSP INPUT REGISTERS  (work item A)
+    //
+    // lane_a / lane_b are COMBINATIONAL: they are the precision-dependent
+    // field extraction and sign extension applied to the operand word, and
+    // they cost several LUT levels between the operand register and the
+    // multiplier.  Registering them here puts a register directly on the
+    // DSP48E1 A and B inputs, which
+    //
+    //   (a) removes the operand-routing LUTs from the multiplier's critical
+    //       path - they now terminate at lane_a_r / lane_b_r, and
+    //   (b) presents the standard registered-DSP structure to Vivado, making
+    //       lane_a_r/lane_b_r legal candidates for the DSP48E1's own AREG and
+    //       BREG input registers.  Together with prod*_r (PREG) that gives a
+    //       fully registered DSP: AREG/BREG -> multiplier -> PREG.
+    //
+    // Whether Vivado actually absorbs them is VERIFIABLE ONLY IN VIVADO and
+    // is NOT claimed here.  The split is beneficial either way: even as plain
+    // fabric flip-flops they shorten the combinational cone.
+    // ========================================================================
+    reg signed [LANE_IN_W-1:0] lane_a_r [0:LANES-1];
+    reg signed [LANE_IN_W-1:0] lane_b_r [0:LANES-1];
+    integer ki;
+    always @(posedge clk)
+        for (ki = 0; ki < LANES; ki = ki + 1)
+        begin
+            lane_a_r[ki] <= lane_a[ki];
+            lane_b_r[ki] <= lane_b[ki];
+        end
+    wire signed [35:0] prod0 = lane_a_r[0] * lane_b_r[0];
+    wire signed [35:0] prod1 = lane_a_r[1] * lane_b_r[1];
+    wire signed [35:0] prod2 = lane_a_r[2] * lane_b_r[2];
+    wire signed [35:0] prod3 = lane_a_r[3] * lane_b_r[3];
+
+    // ========================================================================
+    // TIMING PIPELINE - STAGE 2 REGISTERS
+    //
+    // The multiplier array inside a DSP48E1 is the single slowest block on the
+    // post-route critical path.  With AREG/BREG/MREG/PREG all 0 the whole
+    // operand -> product -> INT32-recombination -> 64-bit-accumulate chain was
+    // one combinational cone of 33 cells (~17.8 ns at 100 MHz).
+    //
+    // These registers capture the four products one clock after the operands
+    // are presented.  Vivado can absorb them into the DSP48E1's own PREG/MREG
+    // pipeline registers, so they cost no fabric flip-flops.
+    //
+    // The lane enables are registered alongside the products: they are derived
+    // from consume_word, so they must travel with the data they describe.
+    // ========================================================================
+
+    reg signed [35:0] prod0_r, prod1_r, prod2_r, prod3_r;
+
+    always @(posedge clk)
+    begin
+        prod0_r <= prod0;
+        prod1_r <= prod1;
+        prod2_r <= prod2;
+        prod3_r <= prod3;
+    end
+
+
+    // ========================================================================
+    // INT32 SIGNED DECOMPOSITION AND RECOMBINATION  (contract section 5.4)
+    //
+    //   A = A1 * 2^16 + A0        A1 signed 16, A0 unsigned 16
+    //   B = B1 * 2^16 + B0        B1 signed 16, B0 unsigned 16
+    //
+    //   A * B = p11 * 2^32 + (p10 + p01) * 2^16 + p00
+    // ========================================================================
+
+    wire signed [31:0] p11 = prod0_r[31:0];
+    wire signed [31:0] p10 = prod1_r[31:0];
+    wire signed [31:0] p01 = prod2_r[31:0];
+    wire        [31:0] p00 = prod3_r[31:0];    // unsigned result of u x u
+
+    // ---------------------------------------------------------------------
+    // The four partial products are handed to the unified reducer BELOW as
+    // four separate, already-shifted 64-bit terms.  They are deliberately
+    // NOT recombined here.
+    //
+    // Forming s_mid = p10 + p01 first (as an earlier revision did) puts a
+    // 33-bit carry chain directly between the DSP and the reducer, which
+    // measured 5 extra CARRY4 on the critical path.  Feeding p10 and p01 in
+    // as two independent terms lets the reducer's own 4:2 carry-save
+    // compressor absorb them with NO carry propagation at all.
+    //
+    //   A * B = p11*2^32 + p10*2^16 + p01*2^16 + p00
+    //
+    // which is exactly term_hi + term_p10 + term_p01 + term_lo.
+    // ---------------------------------------------------------------------
+    wire signed [63:0] term_hi  = {p11, 32'b0};                        // p11 * 2^32
+    wire signed [63:0] term_p10 = {{16{p10[31]}}, p10, 16'b0};         // p10 * 2^16
+    wire signed [63:0] term_p01 = {{16{p01[31]}}, p01, 16'b0};         // p01 * 2^16
+    wire signed [63:0] term_lo  = {32'b0, p00};                        // p00
+
+
+    // ========================================================================
+    // PARTIAL-FINAL-WORD LANE MASK
+    // ========================================================================
+
+    wire [11:0] e0 = elem_index({2'd0, consume_word}, prec, 2'd0);
+    wire [11:0] e1 = elem_index({2'd0, consume_word}, prec, 2'd1);
+    wire [11:0] e2 = elem_index({2'd0, consume_word}, prec, 2'd2);
+    wire [11:0] e3 = elem_index({2'd0, consume_word}, prec, 2'd3);
+
+    wire lane_en0 = (e0 < length_reg);
+    wire lane_en1 = (e1 < length_reg);
+    wire lane_en2 = (e2 < length_reg);
+    wire lane_en3 = (e3 < length_reg);
+
+    // The lane enables describe the word that is in the multiplier right now,
+    // so they are registered by the same stage-2 clock that captures prod0..3.
+    // Without this the recombination would apply the NEXT word's mask to the
+    // CURRENT word's products.
+    // The products now pass through lane_a_r / lane_b_r BEFORE the
+    // multipliers, so prod0_r..prod3_r are ONE stage later than they used to
+    // be.  The lane enables must therefore be delayed by two stages, not one,
+    // or the reduction applies the NEXT word's mask to the CURRENT word's
+    // products.  (This misalignment is exactly what produced the wrong
+    // results in the first version of work item A.)
+    reg lane_en0_r, lane_en1_r, lane_en2_r, lane_en3_r;
+    reg lane_en0_r2, lane_en1_r2, lane_en2_r2, lane_en3_r2;
+
+    always @(posedge clk)
+    begin
+        lane_en0_r <= lane_en0;
+        lane_en1_r <= lane_en1;
+        lane_en2_r <= lane_en2;
+        lane_en3_r <= lane_en3;
+
+        lane_en0_r2 <= lane_en0_r;
+        lane_en1_r2 <= lane_en1_r;
+        lane_en2_r2 <= lane_en2_r;
+        lane_en3_r2 <= lane_en3_r;
+    end
+
+
+    // ========================================================================
+    // ADDEND  (what one consumed word contributes to the accumulator)
+    // ========================================================================
+
+    // Every operation is expressed as the sum of four 64-bit terms, so that
+    // ONE balanced reducer serves all of them and every mode has the SAME
+    // pipeline depth.  No mode can become a surprise critical path.
+    //
+    //   INT8        : t0..t3 = the four gated, sign-extended lane products
+    //   INT16       : t0,t1  = the two gated lane products; t2 = t3 = 0
+    //                          (lanes 2 and 3 multiply by zero in INT16 mode,
+    //                           so their contribution is identically zero -
+    //                           adding them is safe as well as uniform)
+    //   INT32       : t0..t3 = p11, p10, p01, p00 pre-shifted (recombination)
+    //   scalar ADD  : t0 = a64_r,  t1 = b64_r
+    //   scalar SUB  : t0 = a64_r,  t1 = ~b64_r, t2 = 1   (two's complement)
+    //   scalar MUL  : t0..t3 = the four pre-shifted partial products
+    //   scalar MAC  : t0..t3 = the four pre-shifted partial products
+    //   scalar NOP  : t0 = acc                     (pass through unchanged)
+    reg [63:0] t0, t1, t2, t3;
+
+    always @*
+    begin
+        if (in_scalar)
+        begin
+            case (opcode)
+
+                OP_ADD:
+                begin
+                    t0 = a64_r;   t1 = b64_r;    t2 = 64'd0;   t3 = 64'd0;
+                end
+
+                // a - b == a + ~b + 1 : exact two's-complement identity.
+                OP_SUB:
+                begin
+                    t0 = a64_r;   t1 = ~b64_r;   t2 = 64'd1;   t3 = 64'd0;
+                end
+
+                OP_MUL, OP_MAC:
+                begin
+                    t0 = term_hi;  t1 = term_p10;  t2 = term_p01;  t3 = term_lo;
+                end
+
+                default:                                   // OP_NOP
+                begin
+                    t0 = acc;     t1 = 64'd0;    t2 = 64'd0;   t3 = 64'd0;
+                end
+
+            endcase
+        end
+        else if (routing == PREC_INT32)
+        begin
+            t0 = term_hi;        t1 = term_p10;   t2 = term_p01;  t3 = term_lo;
+        end
+        else
+        begin
+            t0 = lane_en0_r2 ? ext_prod(prod0_r, routing) : 64'd0;
+            t1 = lane_en1_r2 ? ext_prod(prod1_r, routing) : 64'd0;
+            t2 = lane_en2_r2 ? ext_prod(prod2_r, routing) : 64'd0;
+            t3 = lane_en3_r2 ? ext_prod(prod3_r, routing) : 64'd0;
+        end
+    end
+
+
+    // ---------------------------------------------------------------------
+    // Stage-3 carry-select reduction.
+    //
+    // The low half and BOTH candidate high halves are computed in parallel,
+    // so the carry chain is 32 bits (8 CARRY4) instead of 64 (16).  The
+    // carry out of the low half selects the correct high half afterwards.
+    //
+    // Exactness: for two's-complement data,
+    //     { red_c ? red_hi1 : red_hi0, red_lo } == t0+t1+t2+t3  (mod 2^64)
+    // The high halves are summed modulo 2^32, which is exactly the required
+    // behaviour for the upper half of a two's-complement add.
+    // ---------------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // IMPORTANT: the carry out of the low half of a FOUR-term sum is in
+    // the range 0..3, not 0..1.  Selecting between only two high-half
+    // candidates is therefore WRONG (it loses 2 or 3 carries).
+    //
+    // The four terms are first compressed to TWO terms with a 4:2
+    // carry-save compressor (two 3:2 stages, each one LUT level - no carry
+    // propagation at all).  A two-term sum has a carry of exactly 0 or 1,
+    // so the carry-select below is then exact.
+    //
+    //   t0 + t1 + t2 + t3  ==  cs_s2 + cs_c2        (mod 2^64)
+    // -----------------------------------------------------------------
+    // The majority term is declared [62:0] because the carry term is formed as
+    // {maj, 1'b0} == 2*maj (mod 2^64), in which bit 63 of maj is shifted out
+    // of the 64-bit word and therefore provably does not exist in the result.
+    // Declaring the exact width of the value that is actually used is not a
+    // width change: the arithmetic, and every bit of cs_s*/cs_c*, is identical.
+    wire [63:0] cs_s1 = t0 ^ t1 ^ t2;
+    wire [62:0] cs_m1 = (t0[62:0] & t1[62:0]) | (t0[62:0] & t2[62:0])
+                      | (t1[62:0] & t2[62:0]);
+    wire [63:0] cs_c1 = {cs_m1, 1'b0};                  // 2 * maj (mod 2^64)
+
+    wire [63:0] cs_s2 = cs_s1 ^ cs_c1 ^ t3;
+    wire [62:0] cs_m2 = (cs_s1[62:0] & cs_c1[62:0]) | (cs_s1[62:0] & t3[62:0])
+                      | (cs_c1[62:0] & t3[62:0]);
+    wire [63:0] cs_c2 = {cs_m2, 1'b0};                  // 2 * maj (mod 2^64)
+
+    // Two-term carry-select: carry is 0 or 1, so two candidates suffice.
+    wire [32:0] red_lo  = {1'b0, cs_s2[31:0]} + {1'b0, cs_c2[31:0]};
+
+    wire [31:0] red_hi0 = cs_s2[63:32] + cs_c2[63:32];
+    wire [31:0] red_hi1 = cs_s2[63:32] + cs_c2[63:32] + 32'd1;
+
+    reg [31:0] red_lo_r;
+    reg [31:0] red_hi0_r;
+    reg [31:0] red_hi1_r;
+    reg        red_c_r;
+
+    always @(posedge clk)
+    begin
+        red_lo_r  <= red_lo[31:0];
+        red_hi0_r <= red_hi0;
+        red_hi1_r <= red_hi1;
+        red_c_r   <= red_lo[32];
+    end
+
+
+    // ========================================================================
+    // ELEMENT COUNT FOR THE WORD BEING CONSUMED *NOW*
+    //
+    // `elem_add` above is derived from the REGISTERED lane enables, so it
+    // describes the previous word.  The pipeline control needs the count for
+    // the word entering the pipe on the current clock, which comes from the
+    // unregistered enables - these track consume_word combinationally.  This
+    // is the value that is shifted along with the data.
+    // ========================================================================
+
+    reg [2:0] elem_add_now;
+
+    always @*
+    begin
+        if (in_scalar)
+            elem_add_now = (opcode == OP_NOP) ? 3'd0 : 3'd1;
+        else
+            case (prec)
+
+                PREC_INT16:
+                    elem_add_now = {2'd0, lane_en0} + {2'd0, lane_en1};
+
+                PREC_INT32:
+                    elem_add_now = 3'd1;
+
+                default:                                    // PREC_INT8
+                    elem_add_now = {2'd0, lane_en0} + {2'd0, lane_en1}
+                                 + {2'd0, lane_en2} + {2'd0, lane_en3};
+
+            endcase
+    end
+
+
+    // ========================================================================
+    // ACCUMULATOR UPDATE, OVERFLOW AND SATURATION  (contract 5.5, 5.6)
+    //
+    //   acc_next = acc_src + addend_or_result
+    //   overflow = (acc_src[63] == addend[63]) && (acc_next[63] != acc_src[63])
+    //
+    // Overwriting opcodes use acc_src = 0, so the result replaces the
+    // accumulator and the overflow equation is structurally 0 for them - which
+    // is exactly what the contract states.
+    // ========================================================================
+
+    wire is_accumulate = (opcode == OP_DOT) || (opcode == OP_MAC);
+
+    // ---- Pipeline stage 2 for the SCALAR datapath --------------------------
+    //
+    // ADD and SUB do not go through the DSP, so they would otherwise reach the
+    // accumulator one stage earlier than MUL and DOT.  Registering the
+    // sign-extended operands here puts every scalar operation on the same
+    // two-stage pipeline as the vector path, which keeps the latency contract
+    // uniform (see the pipeline note in the FSM).
+    // TWO stages, to match the vector path now that lane_a_r/lane_b_r sit in
+    // front of the multipliers.  Without the second stage ADD and SUB would
+    // reach the accumulator one clock earlier than MUL and MAC.
+    reg [63:0] a64_pre;
+    reg [63:0] b64_pre;
+    reg [63:0] a64_r;
+    reg [63:0] b64_r;
+    always @(posedge clk)
+    begin
+        a64_pre <= sext64(sext32(operand_a, prec), prec);
+        b64_pre <= sext64(sext32(operand_b, prec), prec);
+        a64_r   <= a64_pre;
+        b64_r   <= b64_pre;
+    end
+
+    // a64_r / b64_r feed the unified reducer directly (t0 / t1).
+
+    // ---------------------------------------------------------------------
+    // EXPLICIT-WIDTH ARITHMETIC  (fixes the [Synth 37-78] 64/64/64 reports)
+    //
+    // a64 + b64  is sized 65 bits by Vivado (64-bit operands plus carry).
+    // a64 - b64  is sized 66 bits (Vivado forms it as a + ~b + 1, and the
+    //            two-step widening reaches 66 bits).
+    // Assigning either straight into a 64-bit target silently drops the top
+    // bits, which Vivado reports as [Synth 37-78].
+    //
+    // That truncation is INTENTIONAL and CORRECT: two's-complement add and
+    // subtract keep the low 64 bits and discard the carry / borrow out, which
+    // is exactly the wrap-to-low-64 behaviour the contract requires, and the
+    // signed-overflow test below is defined on the truncated result.
+    //
+    // The full-width intermediates below state that intent in the RTL instead
+    // of leaving it implicit.  The discarded upper bits are carry/borrow only
+    // - they are removed by synthesis and cost no logic.
+    //
+    // EQUIVALENCE with the previous implicit form:
+    //   operands are unsigned, so Verilog zero-extends them to the wider
+    //   context; no carry propagates downwards, therefore the low 64 bits of
+    //   a 65-/66-bit add/sub are bit-identical to the low 64 bits of the same
+    //   operation performed at 64 bits.  Only the evaluation width changes.
+    // ---------------------------------------------------------------------
+
+    // The operands are zero-extended with an explicit concatenation so the
+    // widths match the target exactly.  Relying on Verilog's implicit
+    // context-driven widening would be equivalent arithmetic, but it also
+    // produces WIDTHEXPAND lint messages; stating the extension in the
+    // source removes those and makes the intent unambiguous.
+    // The four-term reduction above already produces the right value for
+    // every mode, so no separate scalar datapath exists any more.  ADD and
+    // SUB are built from the same reducer as MUL and DOT, which is what
+    // guarantees they cannot become the next critical path (work item D).
+    //
+    //   ADD : t0 = a64_r, t1 = b64_r            -> a + b
+    //   SUB : t0 = a64_r, t1 = ~b64_r, t2 = 1   -> a + ~b + 1 == a - b
+    wire [63:0] addend_or_result = { red_c_r ? red_hi1_r : red_hi0_r, red_lo_r };
+
+    // ========================================================================
+    // TIMING PIPELINE - STAGE 3 REGISTER
+    //
+    // This register ends the last long combinational cone: INT32 recombination
+    // and the lane reduction now terminate here, and the accumulator adder
+    // sees an already-registered addend.
+    //
+    // It is loaded unconditionally, which is safe: the pipeline advances in
+    // lockstep with the data, so the value wanted by the accumulator is in
+    // result_r on exactly the clock the FSM asserts the accumulator enable.
+    // ========================================================================
+    reg [63:0] result_r;
+
+    always @(posedge clk)
+        result_r <= addend_or_result;
+
+    wire [63:0] acc_src          = is_accumulate ? acc           : 64'd0;
+
+    // ========================================================================
+    // CARRY-SELECT ACCUMULATOR ADDER  (work item C)
+    //
+    // The 64-bit accumulate previously cost a 16-deep CARRY4 ripple.  The
+    // three operations below are computed IN PARALLEL, so the longest chain
+    // is only 8 CARRY4:
+    //
+    //   lo_full : acc_src[31:0] + result_r[31:0]   -> low half + carry out
+    //   hi_c0   : acc_src[63:32] + result_r[63:32] + 0
+    //   hi_c1   : acc_src[63:32] + result_r[63:32] + 1
+    //
+    // The carry out of the low half selects between the two high candidates.
+    // This is EXACT arithmetic - carry-select is a bit-for-bit identity with
+    // ripple carry, not an approximation:
+    //
+    //   acc_src + result_r == { (lo_c ? hi_c1 : hi_c0), lo_full[31:0] }
+    //
+    // Crucially this adds NO pipeline stage: the loop acc -> adder -> acc
+    // still closes in ONE clock, so one word per clock is preserved.
+    // ========================================================================
+    wire [32:0] lo_full = {1'b0, acc_src[31:0]} + {1'b0, result_r[31:0]};
+    wire        lo_c    = lo_full[32];
+
+    wire [31:0] hi_c0   = acc_src[63:32] + result_r[63:32];
+    wire [31:0] hi_c1   = acc_src[63:32] + result_r[63:32] + 32'd1;
+
+    wire [31:0] sum_hi  = lo_c ? hi_c1 : hi_c0;
+    wire [63:0] sum     = {sum_hi, lo_full[31:0]};
+
+    wire        ovf_now = (acc_src[63] == result_r[63]) &&
+                          (sum[63]     != acc_src[63]);
+
+    wire [63:0] saturated = acc_src[63] ? 64'h8000_0000_0000_0000   // INT64_MIN
+                                        : 64'h7FFF_FFFF_FFFF_FFFF;  // INT64_MAX
+
+    wire [63:0] acc_next = ovf_now ? (saturate ? saturated : sum) : sum;
+
+
+    // ========================================================================
+    // OPERAND SOURCE CONTROL
+    //
+    // data is consumed only when data_ready && opa_valid && opb_valid
+    // stall    : data_ready is set but the source has not produced valid data
+    // ========================================================================
+
+    // consume_now : the word on the bus is taken this clock
+    // stall_now   : data is on the bus but the source says it is not valid
+    wire consume_now = data_ready && opa_valid && opb_valid;
+    wire stall_now   = data_ready && !(opa_valid && opb_valid);
+
+    // ---------------------------------------------------------------------
+    // Pipeline control.
+    //
+    // consume_gate : a word enters the pipe.  Once every word has been
+    //                consumed, `draining` blocks any further entry while the
+    //                last two results work their way through to the
+    //                accumulator.
+    //
+    // acc_en       : high on the clock on which result_r holds a result that
+    //                belongs to a consumed word.  RESULT_PIPE_D clocks after
+    //                the corresponding consume.
+    //
+    // finish_now   : high on the clock on which the FINAL word's result is
+    //                accumulated.  This is when DONE is asserted.
+    // ---------------------------------------------------------------------
+    wire last_word_now = ({2'd0, consume_word} + 12'd1 == {2'd0, word_count});
+    wire consume_gate  = consume_now && !draining;
+    wire acc_en        = acc_valid_sr[RESULT_PIPE_D-1];
+    wire finish_now    = last_word_sr[RESULT_PIPE_D-1];
+
+
+    // ========================================================================
+    // CPU WRITE DETECTION
+    // ========================================================================
+
+    wire reg_write = reg_select && (reg_we != 4'b0000);
+
+    // CTRL is write-only and self-clearing: START and ACC_CLEAR are actions,
+    // not stored bits.
+    wire ctrl_write = reg_write && (reg_addr == IDX_CTRL);
+    wire start_req  = ctrl_write && reg_we[0] && reg_wdata[CTRL_START];
+    wire acc_clear  = ctrl_write && reg_we[0] && reg_wdata[CTRL_ACC_CLEAR];
+
+
+    // ========================================================================
+    // SEQUENTIAL BLOCK:  MMIO REGISTER WRITES  +  FSM
+    //
+    // All writes to acc live in this one block so there is exactly one driver.
+    // Register writes are honoured only while the engine is idle.
+    // ========================================================================
+
+    always @(posedge clk)
+    begin
+        if (reset)
+        begin
+            state        <= S_IDLE;
+            acc          <= 64'd0;
+            config_reg   <= 32'd0;
+            length_reg   <= 12'd0;
+            operand_a    <= 32'd0;
+            operand_b    <= 32'd0;
+            done_flag    <= 1'b0;
+            err_flag     <= 1'b0;
+            ovf_flag     <= 1'b0;
+            addr_a       <= {OPERAND_ADDR_W{1'b0}};
+            addr_b       <= {OPERAND_ADDR_W{1'b0}};
+            fetch_word   <= 10'd0;
+            consume_word <= 10'd0;
+            recovering   <= 1'b0;
+            draining     <= 1'b0;
+            acc_valid_sr <= 4'b0000;
+            last_word_sr <= 4'b0000;
+            elem_add_d1  <= 3'd0;
+            elem_add_d2  <= 3'd0;
+            elem_add_d3  <= 3'd0;
+            elem_add_d4  <= 3'd0;
+            exec_cnt     <= 3'd0;
+            pending      <= 1'b0;
+            data_ready   <= 1'b0;
+            cycle_cnt    <= 12'd0;
+            elem_cnt     <= 12'd0;
+        end
+        else
+        begin
+
+            // ------------------------------------------------------------
+            // MMIO register writes - ignored while the engine is busy
+            // ------------------------------------------------------------
+
+            if (!busy && reg_write)
+            begin
+                case (reg_addr)
+
+                    IDX_CONFIG:
+                        config_reg <= merge_bytes(config_reg, reg_wdata, reg_we);
+
+                    IDX_LENGTH:
+                        length_reg <= merged_length_word;
+
+                    IDX_OPERAND_A:
+                        operand_a <= merge_bytes(operand_a, reg_wdata, reg_we);
+
+                    IDX_OPERAND_B:
+                        operand_b <= merge_bytes(operand_b, reg_wdata, reg_we);
+
+                    IDX_ACC_LO:
+                        acc[31:0] <= merge_bytes(acc[31:0], reg_wdata, reg_we);
+
+                    IDX_ACC_HI:
+                        acc[63:32] <= merge_bytes(acc[63:32], reg_wdata, reg_we);
+
+                    default:
+                        ;   // CTRL is an action, STATUS/RESULT/CNT are read-only,
+                            // reserved space is ignored.
+
+                endcase
+            end
+
+
+            // ------------------------------------------------------------
+            // START WHILE BUSY  (contract 5.9)
+            //
+            // A START written while the engine is running is discarded and
+            // flagged with ERR.  The run already in progress is untouched and
+            // sets DONE when it finishes.  Software must observe ERR.
+            // ------------------------------------------------------------
+
+            if (busy && start_req)
+                err_flag <= 1'b1;
+
+
+            // ------------------------------------------------------------
+            // FSM
+            // ------------------------------------------------------------
+
+            case (state)
+
+                // ========================================================
+                S_IDLE:
+                // ========================================================
+                begin
+                    if (start_req)
+                    begin
+                        if (!start_valid)
+                        begin
+                            // Rejected start.  DONE is asserted so that a
+                            // polling CPU always terminates; ERR marks the
+                            // result as invalid.  The accumulator is NOT
+                            // touched - validation happens before ACC_CLEAR.
+                            err_flag  <= 1'b1;
+                            done_flag <= 1'b1;
+                            cycle_cnt <= 12'd1;
+                            elem_cnt  <= 12'd0;
+                        end
+                        else
+                        begin
+                            done_flag  <= 1'b0;
+                            err_flag   <= 1'b0;
+                            ovf_flag   <= 1'b0;
+                            cycle_cnt  <= 12'd0;
+                            elem_cnt   <= 12'd0;
+
+                            // Accumulator initialisation (contract 5.3):
+                            //   ACC_CLEAR=1 -> zero
+                            //   ACC_CLEAR=0 -> continue from current value
+                            if (acc_clear)
+                                acc <= 64'd0;
+
+                            // Clear the result pipeline so that a stale valid
+                            // bit from the previous run cannot write a
+                            // leftover result into the accumulator.
+                            draining     <= 1'b0;
+                            acc_valid_sr <= 4'b0000;
+                            last_word_sr <= 4'b0000;
+                            elem_add_d1  <= 3'd0;
+                            elem_add_d2  <= 3'd0;
+                            elem_add_d3  <= 3'd0;
+                            elem_add_d4  <= 3'd0;
+            elem_add_d4  <= 3'd0;
+                            elem_add_d3  <= 3'd0;
+                            elem_add_d4  <= 3'd0;
+            elem_add_d4  <= 3'd0;
+                            exec_cnt     <= 3'd0;
+
+                            if (is_dot)
+                            begin
+                                addr_a       <= BASE_A;
+                                addr_b       <= BASE_B;
+                                fetch_word   <= 10'd1;
+                                consume_word <= 10'd0;
+                                recovering   <= 1'b0;
+                                pending      <= 1'b1;
+                                data_ready   <= 1'b0;
+                                state        <= S_RUN;
+                            end
+                            else
+                            begin
+                                state <= S_EXEC;
+                            end
+                        end
+                    end
+                end
+
+
+                // ========================================================
+                S_RUN:
+                // ========================================================
+                // Vector loop.
+                //
+                // The operand RAM is a synchronous memory, so an address
+                // presented on clock N produces data that is consumed on
+                // clock N + 2.  The address therefore has to advance on
+                // every clock of the run to keep one word per clock:
+                //
+                //   START clock : address of word 0 presented
+                //   clock 1     : address of word 1 presented
+                //   clock 2     : word 0 consumed, address of word 2
+                //   ...
+                //   clock W + 1 : word W - 1 consumed
+                //   clock W + 1 + RESULT_PIPE_D
+                //               : that last result reaches the accumulator
+                //                 -> DONE
+                //
+                // Latency = W + 1 + RESULT_PIPE_D clocks from the START clock
+                // to DONE.  RESULT_PIPE_D (= 2) is the depth of the result
+                // pipeline added for timing closure; see the "TIMING
+                // PIPELINE" notes above.  THROUGHPUT IS UNCHANGED: one word
+                // still enters the pipe on every clock of the run, so the
+                // steady-state rate is still one word per clock.  Only the
+                // fill/drain latency grows, by a constant RESULT_PIPE_D.
+                //
+                // A stalled source (opa_valid / opb_valid low) cannot simply
+                // freeze the loop: the next fetch would overwrite the word
+                // that is waiting to be consumed.  The address is instead
+                // rewound to the unconsumed word and held there.  A
+                // synchronous RAM keeps driving the data of an unchanged
+                // address, so the pending word survives any length of stall
+                // and the run resumes with the correct operand.
+                // ========================================================
+                begin
+                    cycle_cnt <= cycle_cnt + 12'd1;
+
+                    // ---- advance the result-pipeline control --------------
+                    acc_valid_sr <= { acc_valid_sr[2:0], consume_gate };
+                    last_word_sr <= { last_word_sr[2:0],
+                                      consume_gate && last_word_now };
+                    elem_add_d1  <= elem_add_now;
+                    elem_add_d2  <= elem_add_d1;
+                    elem_add_d3  <= elem_add_d2;
+                    elem_add_d4  <= elem_add_d3;
+
+                    // ---- a word enters the pipe on this clock -------------
+                    if (consume_gate)
+                    begin
+                        consume_word <= consume_word + 10'd1;
+                        recovering   <= 1'b0;
+
+                        // Every word has now been presented: stop accepting
+                        // new words and let the last two results drain.
+                        if (last_word_now)
+                            draining <= 1'b1;
+                    end
+
+                    // ---- accumulator update, RESULT_PIPE_D clocks later ---
+                    if (acc_en)
+                    begin
+                        acc      <= acc_next;
+                        ovf_flag <= ovf_flag | ovf_now;
+                        elem_cnt <= elem_cnt + {9'd0, elem_add_d4};
+                    end
+
+                    // ---- finish when the last result has been accumulated --
+                    if (finish_now)
+                    begin
+                        done_flag <= 1'b1;
+                        state     <= S_IDLE;
+                        draining  <= 1'b0;
+                    end
+
+                    if (draining)
+                    begin
+                        // Draining.  The address is frozen and nothing more
+                        // may enter the pipe; the only thing left to do is
+                        // let the outstanding results reach the accumulator.
+                        pending    <= 1'b0;
+                        data_ready <= 1'b0;
+                    end
+                    else if (stall_now && !recovering)
+                    begin
+                        // First stalled clock: re-present the unconsumed word.
+                        addr_a     <= BASE_A + consume_word;
+                        addr_b     <= BASE_B + consume_word;
+                        fetch_word <= consume_word + 10'd1;
+                        recovering <= 1'b1;
+                        pending    <= 1'b1;
+                        data_ready <= 1'b0;
+                    end
+                    else if (recovering && !data_ready)
+                    begin
+                        // Waiting for the re-presented word to come back out
+                        // of the memory.  The address must not move.
+                        pending    <= 1'b1;
+                        data_ready <= pending;
+                    end
+                    else if (stall_now)
+                    begin
+                        // Hold: the address is unchanged, so the RAM keeps
+                        // presenting the word that is waiting to be consumed.
+                        pending    <= 1'b1;
+                        data_ready <= 1'b1;
+                    end
+                    else
+                    begin
+                        // Normal: present the next address, every clock.
+                        if (fetch_word < word_count)
+                        begin
+                            addr_a     <= BASE_A + fetch_word;
+                            addr_b     <= BASE_B + fetch_word;
+                            fetch_word <= fetch_word + 10'd1;
+                            pending    <= 1'b1;
+                        end
+                        else
+                            pending <= 1'b0;
+
+                        // The clock right after a recovered consume still
+                        // carries a duplicate of the word just taken, so it
+                        // must not be consumed a second time.
+                        data_ready <= (recovering && consume_now) ? 1'b0 :
+                                                                    pending;
+                    end
+                end
+
+
+                // ========================================================
+                S_EXEC:
+                // ========================================================
+                // Scalar operation.  No operand fetch: the operands come from
+                // OPERAND_A / OPERAND_B.  Latency = 1 clock.
+                // ========================================================
+                // The scalar operands are already sitting in OPERAND_A /
+                // OPERAND_B when START arrives, but they still have to cross
+                // the same two pipeline stages as a vector word, so the scalar
+                // path costs RESULT_PIPE_D + 1 clocks.  cycle_cnt therefore
+                // reaches RESULT_PIPE_D + 1 instead of 1.
+                begin
+                    cycle_cnt <= cycle_cnt + 12'd1;
+                    exec_cnt  <= exec_cnt + 3'd1;
+
+                    if (exec_cnt == RESULT_PIPE_D)
+                    begin
+                        acc       <= acc_next;
+                        ovf_flag  <= ovf_flag | ovf_now;
+                        elem_cnt  <= (opcode == OP_NOP) ? 12'd0 : 12'd1;
+                        done_flag <= 1'b1;
+                        state     <= S_IDLE;
+                    end
+                end
+
+
+                // ========================================================
+                // State 2'b11 is unreachable.  The case is completed with a
+                // defensive return to IDLE rather than a latch.
+                // ========================================================
+                default:
+                begin
+                    state <= S_IDLE;
+                end
+
+            endcase
+        end
+    end
+
+
+    // ========================================================================
+    // CPU READ MUX  (combinational)
+    // ========================================================================
+
+    always @*
+    begin
+        case (reg_addr)
+
+            IDX_STATUS:
+            begin
+                reg_rdata            = 32'd0;
+                reg_rdata[STAT_BUSY] = busy;
+                reg_rdata[STAT_DONE] = done_flag;
+                reg_rdata[STAT_OVF]  = ovf_flag;
+                reg_rdata[STAT_ERR]  = err_flag;
+            end
+
+            IDX_CONFIG:
+                reg_rdata = config_reg;
+
+            IDX_LENGTH:
+                reg_rdata = { 20'd0, length_reg };
+
+            IDX_OPERAND_A:
+                reg_rdata = operand_a;
+
+            IDX_OPERAND_B:
+                reg_rdata = operand_b;
+
+            IDX_RESULT_LO:
+                reg_rdata = acc[31:0];
+
+            IDX_RESULT_HI:
+                reg_rdata = acc[63:32];
+
+            IDX_CYCLE_CNT:
+                reg_rdata = { 20'd0, cycle_cnt };
+
+            IDX_ELEM_CNT:
+                reg_rdata = { 20'd0, elem_cnt };
+
+            // CTRL, ACC_LO and ACC_HI are write-only and read as zero.
+            // Reserved register space also reads as zero.
+            default:
+                reg_rdata = 32'd0;
+
+        endcase
+    end
+
+
+    // ========================================================================
+    // OPERAND-SOURCE PORT 0 ARBITRATION  (contract 5.11)
+    //
+    //   idle : the CPU owns port 0 (read / write, byte enables honoured)
+    //   busy : the engine owns port 0, CPU writes are dropped and CPU reads
+    //          return zero
+    // ========================================================================
+
+    assign opa_addr  = busy ? addr_a : mem_addr;
+    assign opa_wdata = mem_wdata;
+    assign opa_we    = busy ? 4'b0000 : (mem_select ? mem_we : 4'b0000);
+
+    assign opb_addr  = addr_b;
+
+    always @*
+    begin
+        mem_rdata = busy ? 32'd0 : opa_rdata;
+    end
+
+
+// synopsys translate_off
+`ifdef DEBUG_TRACE
+    always @(posedge clk)
+        if (state != 0 || consume_gate || acc_en || finish_now || draining)
+            $display("T=%0t st=%0d cg=%b dr=%b avsr=%b lwsr=%b acc_en=%b fin=%b cc=%0d cw=%0d wc=%0d drdy=%b done=%b",
+                     $time, state, consume_gate, draining, acc_valid_sr, last_word_sr,
+                     acc_en, finish_now, cycle_cnt, consume_word, word_count, data_ready, done_flag);
+`endif
+// synopsys translate_on
+
+endmodule
+
+// END OF MODULE: hpu_compute_engine
+// ============================================================================
+
+`timescale 1ns / 1ps
+// ============================================================================
+// PHASE 1 - ADAPTIVE-PRECISION COMPUTE ENGINE - LOCAL OPERAND MEMORY
+//
+// Target Board:
+// Digilent Nexys A7-100T
+// FPGA:
+// Xilinx Artix-7 XC7A100T-1CSG324C
+//
+// Language:
+// Verilog-2001
+//
+// ----------------------------------------------------------------------------
+// PURPOSE
+// ----------------------------------------------------------------------------
+// 1024 x 32-bit local scratchpad holding the two operand vectors that the
+// compute engine processes.
+//
+//   words    0 ..  511  : vector A
+//   words  512 .. 1023  : vector B
+//
+// The split is fixed and architectural: it is what lets the engine fetch A and
+// B in the same clock from two physically separate ports, which is what makes
+// one operand word per clock possible.
+//
+// ----------------------------------------------------------------------------
+// TIMING  (hard requirement - see docs/04_phase1_implementation_contract.md)
+// ----------------------------------------------------------------------------
+// The read is SYNCHRONOUS, exactly like boot_rom and system_ram:
+//
+//     address stable during cycle N
+//  -> RAM latches rdata <= memory[address] at the end of cycle N
+//  -> rdata and valid describe that address during cycle N+1
+//
+// This is not a stylistic choice.  An Artix-7 Block RAM has no asynchronous
+// read path, and the project has already lost time to one synchronous-memory
+// alignment defect (F-01/F-02).  The engine consumes data one clock AFTER it
+// presents an address, and never in the same clock.
+//
+// ----------------------------------------------------------------------------
+// VALID
+// ----------------------------------------------------------------------------
+// port0_valid / port1_valid are asserted only when the corresponding rdata
+// holds the word for the address presented in the PREVIOUS clock.  In Phase 1
+// the port is continuously registered, so valid is 1 on every clock after
+// reset is released and 0 only in the first clock after reset, when rdata is
+// still undefined.
+//
+// In Phase 3 the same two signals come from the shared_memory arbiter instead
+// and de-assert while another client owns the port.  The compute core already
+// honours them, so no core change is needed.  This is the operand-interface
+// seam required by the contract.
+//
+// ----------------------------------------------------------------------------
+// RESET
+// ----------------------------------------------------------------------------
+// The memory array is NOT reset.  That matches system_ram and the Xilinx
+// guidance for Block RAM inference (an unnecessary reset on the data output
+// prevents BRAM inference or costs extra logic).  Only the two valid
+// registers are reset.
+//
+// ----------------------------------------------------------------------------
+// RESOURCE NOTE
+// ----------------------------------------------------------------------------
+// 1024 x 32 bits = 32,768 bits = exactly one RAMB36E1.  This is an
+// architectural expectation.  The actual inference must be confirmed in
+// Vivado - no utilisation figure is claimed here.
+// ============================================================================
+
+module operand_ram
+(
+    input  wire        clk,
+    input  wire        reset,
+
+    // ------------------------------------------------------------------------
+    // PORT 0 - time shared
+    //   engine busy : engine A-vector fetch (read only)
+    //   engine idle : CPU operand-window access (read / write)
+    // ------------------------------------------------------------------------
+
+    input  wire [9:0]  port0_addr,
+    input  wire [31:0] port0_wdata,
+    input  wire [3:0]  port0_we,
+
+    output reg  [31:0] port0_rdata,
+    output reg         port0_valid,
+
+    // ------------------------------------------------------------------------
+    // PORT 1 - engine B-vector fetch (read only)
+    // ------------------------------------------------------------------------
+
+    input  wire [9:0]  port1_addr,
+
+    output reg  [31:0] port1_rdata,
+    output reg         port1_valid
+);
+
+
+    // ------------------------------------------------------------------------
+    // MEMORY ARRAY
+    //
+    // 1024 x 32 bits.
+    //
+    // The ram_style attribute directs Vivado to use Block RAM.
+    // ------------------------------------------------------------------------
+
+    // 1024 words x 32 bits = 32,768 bits = one RAMB36E1.
+    // The port widths are literal [9:0] because the geometry is fixed by
+    // the architecture (contract section 4: no module parameters).
+    localparam OPERAND_WORDS = 1024;
+
+    (* ram_style = "block" *)
+    reg [31:0] memory [0:OPERAND_WORDS-1];
+
+
+    // ------------------------------------------------------------------------
+    // PORT 0 - WRITE / READ
+    //
+    // The read statement follows the always block's write statements, so on a
+    // clock where the same word is written and read the read returns the OLD
+    // contents (read-first behaviour).  This is the same idiom already used by
+    // rtl/system_ram.v, which keeps the two memories consistent and matches
+    // the Xilinx byte-write Block RAM template.
+    //
+    // A simultaneous read and write of the same word from port 0 cannot occur
+    // in this design anyway: the CPU either reads (we = 0000) or writes, and
+    // the engine only reads port 0.
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+
+        if (port0_we[0])
+            memory[port0_addr][7:0] <=
+                port0_wdata[7:0];
+
+        if (port0_we[1])
+            memory[port0_addr][15:8] <=
+                port0_wdata[15:8];
+
+        if (port0_we[2])
+            memory[port0_addr][23:16] <=
+                port0_wdata[23:16];
+
+        if (port0_we[3])
+            memory[port0_addr][31:24] <=
+                port0_wdata[31:24];
+
+
+        // Synchronous BRAM read: one clock of latency after the address.
+
+        port0_rdata <= memory[port0_addr];
+
+    end
+
+
+    // ------------------------------------------------------------------------
+    // PORT 1 - READ ONLY
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+        port1_rdata <= memory[port1_addr];
+    end
+
+
+    // ------------------------------------------------------------------------
+    // VALID
+    //
+    // Both ports are continuously registered, so their output always
+    // describes the address presented one clock earlier.  Valid is therefore
+    // permanently 1 once reset has been released.
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+        if (reset)
+        begin
+            port0_valid <= 1'b0;
+            port1_valid <= 1'b0;
+        end
+        else
+        begin
+            port0_valid <= 1'b1;
+            port1_valid <= 1'b1;
+        end
+    end
+
+
+endmodule
+
+
+// ============================================================================
+// END OF MODULE: operand_ram
+// ============================================================================
+
+`timescale 1ns / 1ps
+// ============================================================================
+// BOOT ROM
+//
+// 16K x 32-bit
+//
+// Dual read ports:
+//   1. Instruction fetch
+//   2. CPU data read
+//
+// HPU PHASE 1C - STABLE CPU / SOC DIAGNOSTIC
+//
+// ----------------------------------------------------------------------------
+// CHANGE (F-02): the read outputs are now REGISTERED (synchronous).
+//
+// Why:
+//   The previous version used combinational reads (always @*).  A 7-series
+//   Block RAM has no asynchronous read path, so Vivado was forced to build
+//   this 512 Kbit array out of LUT-based distributed RAM - a large fraction of
+//   the device's distributed-RAM capacity, and a routing/timing hazard.
+//   Registering the outputs lets Vivado infer Block RAM (16 x RAMB36E1 for
+//   16,384 x 32) and makes the Boot ROM use exactly the same synchronous
+//   one-cycle-latency timing model as system_ram and the future shared_memory.
+//
+// Consequences:
+//   * The instruction memory now has a 1-cycle read latency.  This requires
+//     hpu_cpu to drive instr_addr combinationally (F-01), which it now does.
+//   * No reset is applied to the read-output registers: Xilinx guidance for
+//     Block RAM inference is to avoid resetting the data output.  The CPU
+//     never samples the ROM before the first fetch completes (verified by
+//     simulation), so there is no start-up ambiguity.
+//   * Logical geometry, NOP fill and all 24 program words are unchanged.
+// ----------------------------------------------------------------------------
+// ============================================================================
+
+module boot_rom
+(
+    input  wire        clk,
+
+    input  wire [13:0] instr_word_addr,
+    output reg  [31:0] instr_rdata,
+
+    input  wire [13:0] data_word_addr,
+    output reg  [31:0] data_rdata
+);
+
+    (* ram_style = "block" *)
+    reg [31:0] rom [0:16383];
+
+    integer j;
+
+
+    // ------------------------------------------------------------------------
+    // INSTRUCTION READ PORT
+    //
+    // Synchronous read: the addressed word appears one clock after the
+    // address is applied - the standard Block RAM read model.
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+        instr_rdata <= rom[instr_word_addr];
+    end
+
+
+    // ------------------------------------------------------------------------
+    // DATA READ PORT
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+        data_rdata <= rom[data_word_addr];
+    end
+
+
+    // ------------------------------------------------------------------------
+    // BOOT / DIAGNOSTIC PROGRAM
+    //
+    // Register allocation:
+    //
+    // x1  GPIO base
+    // x2  RAM base
+    // x3  value A
+    // x4  value B
+    // x5  ADD result
+    // x6  loaded RAM value
+    // x7  expected value
+    // x8  timer base
+    // x9  timer value
+    // x18 diagnostic output
+    //
+    // Final PASS:
+    //
+    // LED = C0DE
+    //
+    // Failure:
+    //
+    // LED = DEAD
+    // ------------------------------------------------------------------------
+
+    initial
+    begin
+
+        // ------------------------------------------------------------
+        // Default all ROM locations to NOP
+        // ------------------------------------------------------------
+
+        for (j = 0; j < 16384; j = j + 1)
+        begin
+            rom[j] = 32'h0000_0013;
+        end
+
+
+        // ============================================================
+        // INITIALIZATION
+        // ============================================================
+
+
+        // rom[0]
+        //
+        // LUI x1, 0x40001
+        //
+        // x1 = 0x40001000
+        // GPIO output base
+
+        rom[0] = 32'h4000_10B7;
+
+
+        // rom[1]
+        //
+        // LUI x2, 0x00010
+        //
+        // x2 = 0x00010000
+        // System RAM base
+
+        rom[1] = 32'h0001_0137;
+
+
+        // rom[2]
+        //
+        // ADDI x3, x0, 0x100
+
+        rom[2] = 32'h1000_0193;
+
+
+        // rom[3]
+        //
+        // ADDI x4, x0, 0x055
+
+        rom[3] = 32'h0550_0213;
+
+
+        // ============================================================
+        // ALU TEST
+        //
+        // x5 = x3 + x4
+        //
+        // 0x100 + 0x055 = 0x155
+        // ============================================================
+
+
+        // rom[4]
+        //
+        // ADD x5, x3, x4
+
+        rom[4] = 32'h0041_82B3;
+
+
+        // ============================================================
+        // RAM STORE
+        //
+        // Store x5 at RAM base
+        // ============================================================
+
+
+        // rom[5]
+        //
+        // SW x5, 0(x2)
+
+        rom[5] = 32'h0051_2023;
+
+
+        // ============================================================
+        // RAM LOAD
+        //
+        // Load RAM base into x6
+        // ============================================================
+
+
+        // rom[6]
+        //
+        // LW x6, 0(x2)
+
+        rom[6] = 32'h0001_2303;
+
+
+        // ============================================================
+        // EXPECTED VALUE
+        // ============================================================
+
+
+        // rom[7]
+        //
+        // ADDI x7, x0, 0x155
+
+        rom[7] = 32'h1550_0393;
+
+
+        // ============================================================
+        // CHECK ALU + RAM RESULT
+        //
+        // BEQ x5, x7, +8
+        //
+        // If equal -> skip FAIL jump
+        // ============================================================
+
+
+        // rom[8]
+
+        rom[8] = 32'h0072_8463;
+
+
+        // rom[9]
+        //
+        // JAL x0, FAIL
+        //
+        // FAIL is rom[20]
+        //
+        // Offset:
+        // (20 - 9) * 4 = 44 = 0x2C
+
+        rom[9] = 32'h02C0_006F;
+
+
+        // ============================================================
+        // CHECK RAM LOAD
+        //
+        // BEQ x6, x7, +8
+        // ============================================================
+
+
+        // rom[10]
+
+        rom[10] = 32'h0073_0463;
+
+
+        // rom[11]
+        //
+        // JAL x0, FAIL
+        //
+        // (20 - 11) * 4 = 36 = 0x24
+
+        rom[11] = 32'h0240_006F;
+
+
+        // ============================================================
+        // TIMER TEST
+        //
+        // Read timer and ensure it is non-zero
+        // ============================================================
+
+
+        // rom[12]
+        //
+        // LUI x8, 0x40002
+        //
+        // x8 = 0x40002000
+
+        rom[12] = 32'h4000_2437;
+
+
+        // rom[13]
+        //
+        // LW x9, 0(x8)
+
+        rom[13] = 32'h0004_2483;
+
+
+        // rom[14]
+        //
+        // BNE x9, x0, +8
+        //
+        // If timer != 0 -> PASS
+
+        rom[14] = 32'h0004_9463;
+
+
+        // rom[15]
+        //
+        // JAL x0, FAIL
+        //
+        // (20 - 15) * 4 = 20 = 0x14
+
+        rom[15] = 32'h0140_006F;
+
+
+        // ============================================================
+        // PASS
+        // ============================================================
+
+
+        // rom[16]
+        //
+        // LUI x18, 0x0000C
+        //
+        // x18 = 0x0000C000
+
+        rom[16] = 32'h0000_C937;
+
+
+        // rom[17]
+        //
+        // ADDI x18, x18, 0x0DE
+        //
+        // x18 = 0x0000C0DE
+
+        rom[17] = 32'h0DE9_0913;
+
+
+        // rom[18]
+        //
+        // SW x18, 0(x1)
+        //
+        // LED = C0DE
+
+        rom[18] = 32'h0120_A023;
+
+
+        // rom[19]
+        //
+        // PASS LOOP
+
+        rom[19] = 32'h0000_006F;
+
+
+        // ============================================================
+        // FAIL
+        // ============================================================
+
+
+        // rom[20]
+        //
+        // LUI x18, 0x0000E
+        //
+        // x18 = 0x0000E000
+
+        rom[20] = 32'h0000_E937;
+
+
+        // rom[21]
+        //
+        // ADDI x18, x18, -339
+        //
+        // 0xE000 - 0x153 = 0xDEAD
+
+        rom[21] = 32'hEAD9_0913;
+
+
+        // rom[22]
+        //
+        // SW x18, 0(x1)
+        //
+        // LED = DEAD
+
+        rom[22] = 32'h0120_A023;
+
+
+        // rom[23]
+        //
+        // FAIL LOOP
+
+        rom[23] = 32'h0000_006F;
 
     end
 
 endmodule
 
 
-
 // ============================================================================
-// 64 KiB UNIFIED SYSTEM RAM
+// END OF MODULE: boot_rom
+// ============================================================================
+
+`timescale 1ns / 1ps
+// ============================================================================
+// HPU SYSTEM RAM
+// ============================================================================
 //
-// 16K words x 32 bits = 64 KiB.
+// Artix-7 BRAM-friendly dual-port system memory.
 //
-// Four 8-bit BRAM banks:
-//
-//   Bank 0 -> [7:0]
-//   Bank 1 -> [15:8]
-//   Bank 2 -> [23:16]
-//   Bank 3 -> [31:24]
+// Capacity:
+//     16,384 words × 32 bits
+//     = 65,536 bytes
+//     = 64 KiB
 //
 // Port A:
-//   Instruction fetch
+//     Instruction fetch
 //
 // Port B:
-//   CPU data / future HPU shared memory
+//     CPU data read/write
 //
-// CPU always wins when CPU and HPU request simultaneously.
+// Vivado is directed to infer Block RAM instead of LUT RAM.
+//
 // ============================================================================
 
-module system_ram(
-    input wire clk,
-    input wire reset,
-
-    input wire [13:0] instr_word_addr,
-    output wire [31:0] instr_rdata,
-
-    input wire        cpu_data_req,
-    input wire [13:0] cpu_data_word_addr,
-    input wire [31:0] cpu_data_wdata,
-    input wire [3:0]  cpu_we,
-    output wire [31:0] cpu_data_rdata,
-
-    input wire        hpu_mem_req,
-    input wire [13:0] hpu_mem_word_addr,
-    input wire [31:0] hpu_mem_wdata,
-    input wire [3:0]  hpu_mem_we,
-    output wire [31:0] hpu_mem_rdata,
-    output wire        hpu_mem_grant
-);
-
-    // CPU has priority over the future HPU shared-memory master.
-    wire shared_req = cpu_data_req | hpu_mem_req;
-    wire [13:0] shared_addr = cpu_data_req ? cpu_data_word_addr : hpu_mem_word_addr;
-    wire [31:0] shared_wdata = cpu_data_req ? cpu_data_wdata : hpu_mem_wdata;
-    wire [3:0] shared_we = cpu_data_req ? cpu_we : hpu_mem_we;
-
-    assign hpu_mem_grant = hpu_mem_req && !cpu_data_req;
+module system_ram
+(
+    input  wire        clk,
 
     // ------------------------------------------------------------------------
-    // 64 KiB unified memory: 16K x 32-bit true dual-port Block RAM.
-    //
-    // Port A = instruction read.
-    // Port B = CPU/HPU shared data access with byte write enables.
-    //
-    // READ_LATENCY=2 is deliberate. For 7-series Block RAM, AMD documents
-    // that latency 1 uses the memory latch while latency 2 enables the native
-    // BRAM output register. This is the correct fix for SYNTH-6.
+    // INSTRUCTION PORT
     // ------------------------------------------------------------------------
 
-    wire [31:0] shared_rdata;
-    wire        memory_sleep;
-
-    // The 7-series XPM sleep input is not used for functional power control.
-    // It is driven by the existing synchronous system reset so the input is
-    // a real signal rather than an optimized constant. WAKEUP_TIME remains
-    // disabled.
-    assign memory_sleep = reset;
-
-    xpm_memory_tdpram #(
-        .ADDR_WIDTH_A(14),
-        .ADDR_WIDTH_B(14),
-        .AUTO_SLEEP_TIME(0),
-        .BYTE_WRITE_WIDTH_A(8),
-        .BYTE_WRITE_WIDTH_B(8),
-        .CASCADE_HEIGHT(0),
-        .CLOCKING_MODE("common_clock"),
-        .ECC_MODE("no_ecc"),
-        .MEMORY_INIT_FILE("none"),
-        .MEMORY_INIT_PARAM(""),
-        .MEMORY_OPTIMIZATION("true"),
-        .MEMORY_PRIMITIVE("block"),
-        .MEMORY_SIZE(524288),
-        .MESSAGE_CONTROL(0),
-        .RAM_DECOMP("area"),
-        .READ_DATA_WIDTH_A(32),
-        .READ_DATA_WIDTH_B(32),
-        .READ_LATENCY_A(2),
-        .READ_LATENCY_B(2),
-        .READ_RESET_VALUE_A("0"),
-        .READ_RESET_VALUE_B("0"),
-        .RST_MODE_A("SYNC"),
-        .RST_MODE_B("SYNC"),
-        .SIM_ASSERT_CHK(0),
-        .USE_EMBEDDED_CONSTRAINT(0),
-        .USE_MEM_INIT(0),
-        .WAKEUP_TIME("disable_sleep"),
-        .WRITE_DATA_WIDTH_A(32),
-        .WRITE_DATA_WIDTH_B(32),
-        .WRITE_MODE_A("read_first"),
-        .WRITE_MODE_B("read_first"),
-        .WRITE_PROTECT(0)
-    ) memory_bank0 (
-        .addra(instr_word_addr),
-        .addrb(shared_addr),
-        .clka(clk),
-        .clkb(clk),
-        .dina(32'd0),
-        .dinb(shared_wdata),
-        .ena(1'b1),
-        .enb(shared_req),
-        .wea(4'b0000),
-        .web(shared_we),
-        .douta(instr_rdata),
-        .doutb(shared_rdata),
-        .regcea(1'b1),
-        .regceb(1'b1),
-        .rsta(1'b0),
-        .rstb(1'b0),
-        .sleep(memory_sleep),
-        .injectdbiterra(1'b0),
-        .injectdbiterrb(1'b0),
-        .injectsbiterra(1'b0),
-        .injectsbiterrb(1'b0),
-        .dbiterra(),
-        .dbiterrb(),
-        .sbiterra(),
-        .sbiterrb()
-    );
-
-    assign cpu_data_rdata = cpu_data_req ? shared_rdata : 32'd0;
-    assign hpu_mem_rdata = (hpu_mem_req && !cpu_data_req) ? shared_rdata : 32'd0;
-
-endmodule
+    input  wire [13:0] instr_word_addr,
+    output reg  [31:0] instr_rdata,
 
 
-// ============================================================================
-// GPIO
-// ============================================================================
+    // ------------------------------------------------------------------------
+    // DATA PORT
+    // ------------------------------------------------------------------------
 
-module gpio_unit(
-    input wire        clk,
-    input wire        reset,
-    input wire        write_enable,
-    input wire [15:0] wdata,
-    output reg [15:0] leds
+    input  wire [13:0] data_word_addr,
+    input  wire [31:0] data_wdata,
+    input  wire [3:0]  we,
+
+    output reg  [31:0] data_rdata
 );
 
-    always @(posedge clk) begin
 
-        if (reset)
-            leds <= 16'd0;
+    // ------------------------------------------------------------------------
+    // MEMORY ARRAY
+    //
+    // 16,384 × 32 bits
+    //
+    // The ram_style attribute tells Vivado to implement this memory using
+    // dedicated Artix-7 Block RAM resources.
+    // ------------------------------------------------------------------------
 
-        else if (write_enable)
-            leds <= wdata;
+    (* ram_style = "block" *)
+    reg [31:0] memory [0:16383];
+
+
+    // ------------------------------------------------------------------------
+    // PORT A : INSTRUCTION FETCH
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+        instr_rdata <= memory[instr_word_addr];
+    end
+
+
+    // ------------------------------------------------------------------------
+    // PORT B : DATA READ / WRITE
+    // ------------------------------------------------------------------------
+
+    always @(posedge clk)
+    begin
+
+        // Byte-enable write support.
+
+        if (we[0])
+            memory[data_word_addr][7:0] <=
+                data_wdata[7:0];
+
+        if (we[1])
+            memory[data_word_addr][15:8] <=
+                data_wdata[15:8];
+
+        if (we[2])
+            memory[data_word_addr][23:16] <=
+                data_wdata[23:16];
+
+        if (we[3])
+            memory[data_word_addr][31:24] <=
+                data_wdata[31:24];
+
+
+        // Synchronous BRAM read.
+
+        data_rdata <= memory[data_word_addr];
 
     end
 
+
 endmodule
 
 
-
 // ============================================================================
-// TIMER
+// END OF MODULE: system_ram
 // ============================================================================
 
-module timer_unit(
-    input wire        clk,
-    input wire        reset,
-    output reg [31:0] timer_value
+`timescale 1ns / 1ps
+// ============================================================================
+// GPIO UNIT
+//
+// Output:
+//
+//   LED[15:0]
+//
+// Input:
+//
+//   Switches are read directly by the memory read multiplexer in hpu_top.
+//
+// GPIO therefore only needs the LED write register.
+// ============================================================================
+
+module gpio_unit
+(
+    input  wire        clk,
+    input  wire        reset,
+
+    input  wire        write_enable,
+    input  wire [15:0] wdata,
+
+    output reg  [15:0] leds
 );
 
-    always @(posedge clk) begin
+
+    always @(posedge clk)
+    begin
 
         if (reset)
+
+            leds <= 16'd0;
+
+        else
+        begin
+
+            if (write_enable)
+
+                leds <= wdata;
+
+        end
+
+    end
+
+
+endmodule
+
+
+// ============================================================================
+// END OF MODULE: gpio_unit
+// ============================================================================
+
+`timescale 1ns / 1ps
+// ============================================================================
+// TIMER UNIT
+//
+// Free-running 32-bit cycle counter.
+// ============================================================================
+
+module timer_unit
+(
+    input  wire        clk,
+    input  wire        reset,
+
+    output reg  [31:0] timer_value
+);
+
+
+    always @(posedge clk)
+    begin
+
+        if (reset)
+
             timer_value <= 32'd0;
 
         else
-            timer_value <= timer_value + 32'd1;
+
+            timer_value <=
+                timer_value +
+                32'd1;
 
     end
+
 
 endmodule
 
 
-
 // ============================================================================
-// UART TX
+// END OF MODULE: timer_unit
 // ============================================================================
 
-module uart_tx(
-    input wire       clk,
-    input wire       reset,
-    input wire       start,
-    input wire [7:0] data,
-    output reg       tx,
-    output reg       busy
+`timescale 1ns / 1ps
+// ============================================================================
+// UART TRANSMITTER
+//
+// Configuration:
+//
+//   Clock      : 100 MHz
+//   Baud Rate  : approximately 115200
+//   Data Bits  : 8
+//   Stop Bits  : 1
+//   Parity     : None
+//
+// ============================================================================
+
+module uart_tx
+(
+    input  wire       clk,
+    input  wire       reset,
+
+    input  wire       start,
+    input  wire [7:0] data,
+
+    output reg        tx,
+    output reg        busy
 );
 
-    localparam integer CLKS_PER_BIT = 868;
+
+    localparam CLKS_PER_BIT = 868;
 
 
-    reg [9:0] shift_register;
+    // 9-bit shift register: 8 data bits + stop bit.
+    //
+    // The start bit is driven explicitly (tx <= 1'b0) when a transmission
+    // begins, so it is NOT held in the shift register.  A 10-bit register
+    // was previously used with bit 0 (the start bit) never read, which
+    // produced an "unused bits" warning.  Behaviour is unchanged: the same
+    // bits appear on tx in the same order at the same clock edges.
+    reg [8:0] shift_register;
+
     reg [9:0] clock_counter;
+
     reg [3:0] bit_counter;
 
 
-    always @(posedge clk) begin
+    always @(posedge clk)
+    begin
 
-        if (reset) begin
+
+        if (reset)
+        begin
 
             tx <= 1'b1;
+
             busy <= 1'b0;
 
-            shift_register <= 10'b1111111111;
-
-            clock_counter <= 10'd0;
-            bit_counter <= 4'd0;
-
-        end
-
-
-        else if (!busy) begin
-
-            tx <= 1'b1;
-
-            if (start) begin
-
-                busy <= 1'b1;
-
-                shift_register <=
-                    {1'b1, data, 1'b0};
-
-                clock_counter <= 10'd0;
-                bit_counter <= 4'd0;
-
-                tx <= 1'b0;
-
-            end
-
-        end
-
-
-        else if (clock_counter == CLKS_PER_BIT-1) begin
-
-            clock_counter <= 10'd0;
-
             shift_register <=
-                {1'b1, shift_register[9:1]};
-
-            tx <= shift_register[1];
-
-
-            if (bit_counter == 4'd9) begin
-
-                busy <= 1'b0;
-                tx <= 1'b1;
-
-            end
-
-
-            bit_counter <=
-                bit_counter + 4'd1;
-
-        end
-
-
-        else begin
+                9'b111111111;
 
             clock_counter <=
-                clock_counter + 10'd1;
+                10'd0;
+
+            bit_counter <=
+                4'd0;
 
         end
+
+
+        else
+        begin
+
+
+            // ------------------------------------------------------------
+            // IDLE / START
+            // ------------------------------------------------------------
+
+            if (!busy)
+            begin
+
+                tx <= 1'b1;
+
+
+                if (start)
+                begin
+
+                    busy <= 1'b1;
+
+                    shift_register <=
+                    {
+                        1'b1,
+                        data
+                    };
+
+                    clock_counter <=
+                        10'd0;
+
+                    bit_counter <=
+                        4'd0;
+
+                    // Start bit begins immediately
+
+                    tx <=
+                        1'b0;
+
+                end
+
+            end
+
+
+            // ------------------------------------------------------------
+            // TRANSMISSION
+            // ------------------------------------------------------------
+
+            else
+            begin
+
+
+                if (clock_counter ==
+                    CLKS_PER_BIT - 1)
+                begin
+
+                    clock_counter <=
+                        10'd0;
+
+
+                    shift_register <=
+                    {
+                        1'b1,
+                        shift_register[8:1]
+                    };
+
+
+                    tx <=
+                        shift_register[0];
+
+
+                    if (bit_counter == 4'd9)
+                    begin
+
+                        busy <=
+                            1'b0;
+
+                        tx <=
+                            1'b1;
+
+                    end
+
+
+                    bit_counter <=
+                        bit_counter +
+                        4'd1;
+
+                end
+
+
+                else
+                begin
+
+                    clock_counter <=
+                        clock_counter +
+                        10'd1;
+
+                end
+
+
+            end
+
+
+        end
+
 
     end
 
+
 endmodule
+
+
+// ============================================================================
+// END OF MODULE: uart_tx
+// ============================================================================
