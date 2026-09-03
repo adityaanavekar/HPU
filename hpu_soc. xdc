@@ -1,0 +1,121 @@
+## ================================================================
+## HPU Phase 1
+## Nexys A7-100T
+## XC7A100T-1CSG324C
+## ================================================================
+
+## ================================================================
+## CONFIGURATION / I/O VOLTAGE
+## ================================================================
+
+set_property CFGBVS VCCO [current_design]
+set_property CONFIG_VOLTAGE 3.3 [current_design]
+
+
+## ================================================================
+## CLOCK
+## ================================================================
+
+set_property -dict {
+    PACKAGE_PIN E3
+    IOSTANDARD LVCMOS33
+} [get_ports {CLK100MHZ}]
+
+# Single authoritative 100 MHz system clock.
+create_clock \
+    -name sys_clk_pin \
+    -period 10.000 \
+    -waveform {0.000 5.000} \
+    [get_ports {CLK100MHZ}]
+
+# Clock input jitter: 50 ps.
+set_input_jitter \
+    [get_clocks sys_clk_pin] \
+    0.050
+
+
+## ================================================================
+## RESET
+## ================================================================
+
+set_property -dict {
+    PACKAGE_PIN C12
+    IOSTANDARD LVCMOS33
+} [get_ports {CPU_RESETN}]
+
+# External reset is asynchronous and is synchronized internally
+# by reset_sync in hpu_top.
+set_false_path \
+    -from [get_ports {CPU_RESETN}]
+
+
+## ================================================================
+## SWITCHES
+## ================================================================
+
+set_property -dict { PACKAGE_PIN J15 IOSTANDARD LVCMOS33 } [get_ports {SW[0]}]
+set_property -dict { PACKAGE_PIN L16 IOSTANDARD LVCMOS33 } [get_ports {SW[1]}]
+set_property -dict { PACKAGE_PIN M13 IOSTANDARD LVCMOS33 } [get_ports {SW[2]}]
+set_property -dict { PACKAGE_PIN R15 IOSTANDARD LVCMOS33 } [get_ports {SW[3]}]
+set_property -dict { PACKAGE_PIN R17 IOSTANDARD LVCMOS33 } [get_ports {SW[4]}]
+set_property -dict { PACKAGE_PIN T18 IOSTANDARD LVCMOS33 } [get_ports {SW[5]}]
+set_property -dict { PACKAGE_PIN U18 IOSTANDARD LVCMOS33 } [get_ports {SW[6]}]
+set_property -dict { PACKAGE_PIN R13 IOSTANDARD LVCMOS33 } [get_ports {SW[7]}]
+set_property -dict { PACKAGE_PIN T8  IOSTANDARD LVCMOS18 } [get_ports {SW[8]}]
+set_property -dict { PACKAGE_PIN U8  IOSTANDARD LVCMOS18 } [get_ports {SW[9]}]
+set_property -dict { PACKAGE_PIN R16 IOSTANDARD LVCMOS33 } [get_ports {SW[10]}]
+set_property -dict { PACKAGE_PIN T13 IOSTANDARD LVCMOS33 } [get_ports {SW[11]}]
+set_property -dict { PACKAGE_PIN H6  IOSTANDARD LVCMOS33 } [get_ports {SW[12]}]
+set_property -dict { PACKAGE_PIN U12 IOSTANDARD LVCMOS33 } [get_ports {SW[13]}]
+set_property -dict { PACKAGE_PIN U11 IOSTANDARD LVCMOS33 } [get_ports {SW[14]}]
+set_property -dict { PACKAGE_PIN V10 IOSTANDARD LVCMOS33 } [get_ports {SW[15]}]
+
+# SW inputs are asynchronous to CLK100MHZ and are synchronized in
+# hpu_top by sw_sync. Do not apply identical 0 ns min/max delays to
+# asynchronous pins; that creates an XDC-2 methodology warning.
+# Timing is intentionally cut only to the first synchronizer stage.
+set_false_path \
+    -from [get_ports {SW[*]}] \
+    -to [get_pins -hier -filter {REF_PIN_NAME == D && NAME =~ *sw_sync_reg[0]*}]
+
+
+## ================================================================
+## LEDS
+## ================================================================
+
+set_property -dict { PACKAGE_PIN H17 IOSTANDARD LVCMOS33 } [get_ports {LED[0]}]
+set_property -dict { PACKAGE_PIN K15 IOSTANDARD LVCMOS33 } [get_ports {LED[1]}]
+set_property -dict { PACKAGE_PIN J13 IOSTANDARD LVCMOS33 } [get_ports {LED[2]}]
+set_property -dict { PACKAGE_PIN N14 IOSTANDARD LVCMOS33 } [get_ports {LED[3]}]
+set_property -dict { PACKAGE_PIN R18 IOSTANDARD LVCMOS33 } [get_ports {LED[4]}]
+set_property -dict { PACKAGE_PIN V17 IOSTANDARD LVCMOS33 } [get_ports {LED[5]}]
+set_property -dict { PACKAGE_PIN U17 IOSTANDARD LVCMOS33 } [get_ports {LED[6]}]
+set_property -dict { PACKAGE_PIN U16 IOSTANDARD LVCMOS33 } [get_ports {LED[7]}]
+set_property -dict { PACKAGE_PIN V16 IOSTANDARD LVCMOS33 } [get_ports {LED[8]}]
+set_property -dict { PACKAGE_PIN T15 IOSTANDARD LVCMOS33 } [get_ports {LED[9]}]
+set_property -dict { PACKAGE_PIN U14 IOSTANDARD LVCMOS33 } [get_ports {LED[10]}]
+set_property -dict { PACKAGE_PIN T16 IOSTANDARD LVCMOS33 } [get_ports {LED[11]}]
+set_property -dict { PACKAGE_PIN V15 IOSTANDARD LVCMOS33 } [get_ports {LED[12]}]
+set_property -dict { PACKAGE_PIN V14 IOSTANDARD LVCMOS33 } [get_ports {LED[13]}]
+set_property -dict { PACKAGE_PIN V12 IOSTANDARD LVCMOS33 } [get_ports {LED[14]}]
+set_property -dict { PACKAGE_PIN V11 IOSTANDARD LVCMOS33 } [get_ports {LED[15]}]
+
+# LEDs are asynchronous human-visible outputs; no external timing
+# relationship is required for this project.
+set_false_path \
+    -to [get_ports {LED[*]}]
+
+
+## ================================================================
+## UART
+## ================================================================
+
+set_property -dict {
+    PACKAGE_PIN D4
+    IOSTANDARD LVCMOS33
+} [get_ports {UART_TXD}]
+
+# UART output timing is generated internally by uart_tx and is not
+# constrained as a synchronous FPGA-to-FPGA interface.
+set_false_path \
+    -to [get_ports {UART_TXD}]
